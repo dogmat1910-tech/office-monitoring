@@ -35,11 +35,21 @@ def _get_mac() -> dict | None:
 
     try:
         ws = NSWorkspace.sharedWorkspace()
+        # runningApplications() + isActive() надёжнее чем frontmostApplication(),
+        # который иногда возвращает закешированное значение в долго живущих процессах.
+        for app in ws.runningApplications():
+            if app.isActive():
+                return {
+                    "app_name": str(app.localizedName() or "unknown"),
+                    "title": "",
+                    "pid": int(app.processIdentifier()),
+                }
+        # fallback на frontmostApplication
         app = ws.frontmostApplication()
         if app is None:
             return None
         return {
-            "app_name": str(app.localizedName() or ""),
+            "app_name": str(app.localizedName() or "unknown"),
             "title": "",
             "pid": int(app.processIdentifier()),
         }
