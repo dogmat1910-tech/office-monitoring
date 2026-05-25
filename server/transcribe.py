@@ -68,42 +68,50 @@ def _concat_wav_chunks(chunk_paths: list[Path]) -> tuple[bytes, float]:
     return buf.getvalue(), duration
 
 
+def _transcribe_path(path: Path, vad_filter: bool = True) -> dict:
+    """Ядро транскрипции. Возвращает {text, language, processing_time_seconds}."""
+    model = get_model()
+    t0 = time.monotonic()
+    segments, info = model.transcribe(
+        str(path),
+        language=WHISPER_LANGUAGE if WHISPER_LANGUAGE else None,
+        vad_filter=vad_filter,
+        vad_parameters={"min_silence_duration_ms": 500} if vad_filter else None,
+    )
+    text = " ".join(s.text.strip() for s in segments).strip()
+    return {
+        "text": text,
+        "language": info.language,
+        "processing_time_seconds": time.monotonic() - t0,
+    }
+
+
 def transcribe_meeting(meeting_id: int, chunk_paths: list[Path]) -> dict:
-    """Возвращает {text, language, duration_seconds, processing_time_seconds}.
-    Бросает исключение при ошибке."""
+    """Склеивает WAV-чанки встречи и транскрибирует."""
     if not chunk_paths:
         raise ValueError("нет чанков для транскрипции")
 
     log.info("meeting %d: склеиваем %d чанков", meeting_id, len(chunk_paths))
     wav_bytes, duration = _concat_wav_chunks(chunk_paths)
 
-    # сохраняем во временный файл — faster-whisper берёт путь
     tmp_path = chunk_paths[0].parent / "_concat.wav"
     tmp_path.write_bytes(wav_bytes)
     log.info("meeting %d: aудио %.1f с, %d байт, путь=%s", meeting_id, duration, len(wav_bytes), tmp_path)
 
     try:
-        model = get_model()
-        t0 = time.monotonic()
-        segments, info = model.transcribe(
-            str(tmp_path),
-            language=WHISPER_LANGUAGE if WHISPER_LANGUAGE else None,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
-        )
-        text_parts = [seg.text.strip() for seg in segments]
-        full_text = " ".join(text_parts).strip()
-        elapsed = time.monotonic() - t0
+        result = _transcribe_path(tmp_path, vad_filter=True)
         log.info("meeting %d: транскрипт %.1f с обработки, %d символов, lang=%s",
-                 meeting_id, elapsed, len(full_text), info.language)
-        return {
-            "text": full_text,
-            "language": info.language,
-            "duration_seconds": duration,
-            "processing_time_seconds": elapsed,
-        }
+                 meeting_id, result["processing_time_seconds"], len(result["text"]), result["language"])
+        result["duration_seconds"] = duration
+        return result
     finally:
         try:
             tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def transcribe_voice_segment(opus_path: Path) -> dict:
+    """Транскрибирует один Opus-сегмент. VAD на агенте уже отфильтровал тишину,
+    дополнительный VAD на whisper-стороне отключаем."""
+    return _transcribe_path(opus_path, vad_filter=False)

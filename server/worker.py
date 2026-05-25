@@ -19,9 +19,9 @@ from pathlib import Path
 from sqlmodel import Session, select
 
 # импорт моделей и engine из main.py
-from main import AUDIO_DIR, Analysis, AudioChunk, Meeting, Transcript, engine
+from main import AUDIO_DIR, VOICE_DIR, Analysis, AudioChunk, Meeting, Transcript, VoiceSegment, engine
 from analyze import analyze_transcript
-from transcribe import get_model, transcribe_meeting
+from transcribe import get_model, transcribe_meeting, transcribe_voice_segment
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +57,50 @@ def find_pending_analysis() -> int | None:
             .order_by(Transcript.transcribed_at)
         ).first()
         return transcript.meeting_id if transcript else None
+
+
+def find_pending_voice_segment() -> int | None:
+    """VoiceSegment без транскрипции."""
+    with Session(engine) as session:
+        seg = session.exec(
+            select(VoiceSegment)
+            .where(VoiceSegment.text.is_(None))
+            .order_by(VoiceSegment.started_at)
+        ).first()
+        return seg.id if seg else None
+
+
+def process_voice_segment(segment_id: int) -> None:
+    with Session(engine) as session:
+        seg = session.exec(select(VoiceSegment).where(VoiceSegment.id == segment_id)).first()
+        if seg is None:
+            return
+        opus_path = VOICE_DIR / seg.file_path
+        now = datetime.now(timezone.utc)
+        if not opus_path.exists():
+            log.warning("voice_segment %d: файл %s не найден", segment_id, opus_path)
+            seg.text = "[файл не найден]"
+            seg.transcribed_at = now
+            session.add(seg)
+            session.commit()
+            return
+
+        try:
+            log.info("voice_segment %d: транскрипция (%.1fs)", segment_id, seg.duration_seconds)
+            result = transcribe_voice_segment(opus_path)
+            seg.text = result["text"]
+            seg.language = result.get("language")
+            seg.transcribed_at = now
+            session.add(seg)
+            session.commit()
+            log.info("voice_segment %d: %.1fs обработано, %d символов",
+                     segment_id, result["processing_time_seconds"], len(result["text"]))
+        except Exception as e:
+            log.exception("voice_segment %d: ошибка: %s", segment_id, e)
+            seg.text = f"[ошибка транскрипции: {e}]"
+            seg.transcribed_at = now
+            session.add(seg)
+            session.commit()
 
 
 def get_chunk_paths(meeting_id: int) -> list[Path]:
@@ -132,7 +176,13 @@ def process_one() -> bool:
             })
             return True
 
-    # Этап 2: LLM-анализ
+    # Этап 2: транскрипция voice-сегментов (always-on)
+    seg_id = find_pending_voice_segment()
+    if seg_id is not None:
+        process_voice_segment(seg_id)
+        return True
+
+    # Этап 3: LLM-анализ
     meeting_id = find_pending_analysis()
     if meeting_id is not None:
         text = get_transcript_text(meeting_id)
