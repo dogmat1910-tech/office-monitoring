@@ -79,15 +79,38 @@ _HALLUCINATION_PATTERNS = [
 
 
 def _looks_like_hallucination(text: str) -> bool:
+    """Детект галлюцинаций Whisper: чёрный список + повторы."""
     if not text:
         return True
     t = text.lower().strip(" .,!?-—\"'")
-    # короткое целиком в чёрном списке
+
+    # 1) короткое целиком в чёрном списке
     if len(t) < 80:
         for pat in _HALLUCINATION_PATTERNS:
             if pat in t:
-                # если в коротком тексте есть «триггер» галлюцинации — выкидываем
                 return True
+
+    # 2) повторение фраз: «Вот так. Вот так. Вот так. ...»
+    # ищем повторяющиеся блоки из 2-6 слов
+    words = t.split()
+    if len(words) >= 10:
+        # уникальность слов: если меньше 25% уникальных — это зацикленный шум
+        unique_words = set(words)
+        unique_ratio = len(unique_words) / len(words)
+        if unique_ratio < 0.25:
+            return True
+
+        # детект n-gram повторов: если самый частый bigram занимает > 40% текста
+        for n in (2, 3, 4):
+            if len(words) < n * 3:
+                continue
+            ngrams = [" ".join(words[i:i + n]) for i in range(len(words) - n + 1)]
+            from collections import Counter
+            top_ngram, top_count = Counter(ngrams).most_common(1)[0]
+            # если top n-gram повторяется > 3 раз и занимает > 40% n-grams
+            if top_count >= 3 and (top_count * n) / len(words) > 0.4:
+                return True
+
     return False
 
 
