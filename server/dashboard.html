@@ -70,17 +70,10 @@
     h3 { font-size: 13px; font-weight: 600; margin: 8px 0; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
     .panel { background: var(--panel); border-radius: 8px; padding: 16px; margin: 0 20px 16px; }
 
-    /* Tabs идут сразу под header (top:50px). Под ними — sticky сводка дня (top:96px),
-       которая может скрываться (для вкладки «Команда»). */
-    .day-summary-sticky {
-      position: sticky;
-      top: 96px;
-      background: var(--bg);
-      padding: 14px 20px 0;
-      z-index: 9;
-    }
+    /* Плитки сводки дня — теперь часть контента вкладки «Сегодня», не sticky.
+       На других вкладках свои шапки или их нет. */
     .day-summary {
-      display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 12px;
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 16px 20px 0;
     }
     .day-tile {
       background: var(--panel); border-radius: 8px; padding: 10px 12px;
@@ -380,11 +373,6 @@
         <button class="tab" data-tab="daily">Daily Report</button>
       </nav>
 
-      <!-- Sticky плитки сводки дня (скрываются на вкладке «Команда») -->
-      <div class="day-summary-sticky" id="daySummarySticky">
-        <div id="dayTiles" class="day-summary"></div>
-      </div>
-
       <!-- Tab: Команда -->
       <div class="tab-content" data-tab-content="team">
         <div class="panel">
@@ -407,16 +395,18 @@
         </div>
       </div>
 
-      <!-- Tab: Сегодня — детальный барчарт приложений и доменов -->
+      <!-- Tab: Сегодня — плитки сводки дня + детальный барчарт -->
       <div class="tab-content" data-tab-content="today">
+        <div id="dayTiles" class="day-summary"></div>
         <div class="panel">
           <h2>Приложения и сайты</h2>
           <div id="appsBars"></div>
         </div>
       </div>
 
-      <!-- Tab: Встречи -->
+      <!-- Tab: Встречи — мини-сводка + таблица -->
       <div class="tab-content" data-tab-content="meetings" hidden>
+        <div id="meetingsSummary" class="day-summary"></div>
         <div class="panel">
           <h2>История встреч</h2>
           <div id="meetingsTable"></div>
@@ -483,9 +473,6 @@
       localStorage.setItem("omTab", name);
       $$(".tab").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
       $$(".tab-content").forEach(c => c.hidden = c.dataset.tabContent !== name);
-      // sticky-плитки релевантны только для конкретного агента, не для команды
-      const sticky = $("#daySummarySticky");
-      if (sticky) sticky.style.display = (name === "team" || !selectedAgent) ? "none" : "";
       // подгрузка данных вкладок
       if (name === "team") {
         loadTeam();
@@ -588,6 +575,7 @@
       const voice = await voiceR.json();
 
       renderDayTiles(daySummary);
+      renderMeetingsSummary(daySummary, meetings);
       renderAppsBars(daySummary);
       renderMeetings(meetings);
       renderVoice(voice);
@@ -595,7 +583,7 @@
       $("#updated").textContent = "обновлено " + fmtTime(new Date().toISOString());
     }
 
-    // ───────────── Sticky шапка: 4 плитки ─────────────
+    // ───────────── Шапка «Сегодня»: 4 плитки сводки дня ─────────────
     function renderDayTiles(d) {
       const by = d.by_category || {};
       $("#dayTiles").innerHTML = `
@@ -603,6 +591,20 @@
         <div class="day-tile meeting"><div class="label">встречи</div><div class="value">${fmtSec(d.meeting_seconds || 0)}</div></div>
         <div class="day-tile personal"><div class="label">личное</div><div class="value">${fmtSec(by.personal || 0)}</div></div>
         <div class="day-tile neutral"><div class="label">нейтр.</div><div class="value">${fmtSec(by.neutral || 0)}</div></div>`;
+    }
+
+    // ───────────── Шапка «Встречи»: статистика по встречам ─────────────
+    function renderMeetingsSummary(d, meetings) {
+      const closed = (meetings || []).filter(m => m.ended_at);
+      const total_secs = closed.reduce((s, m) => s + (m.duration_seconds || 0), 0);
+      const active = (meetings || []).filter(m => !m.ended_at).length;
+      const avg = closed.length ? Math.round(total_secs / closed.length) : 0;
+      const longest = closed.length ? Math.max(...closed.map(m => m.duration_seconds || 0)) : 0;
+      $("#meetingsSummary").innerHTML = `
+        <div class="day-tile meeting"><div class="label">всего встреч</div><div class="value">${meetings.length}</div></div>
+        <div class="day-tile work"><div class="label">общее время</div><div class="value">${fmtSec(total_secs)}</div></div>
+        <div class="day-tile neutral"><div class="label">средняя</div><div class="value">${fmtSec(avg)}</div></div>
+        <div class="day-tile ${active > 0 ? 'personal' : 'neutral'}"><div class="label">сейчас идёт</div><div class="value">${active}</div></div>`;
     }
 
     // ───────────── Tab: Сегодня (барчарт приложений и доменов) ─────────────
