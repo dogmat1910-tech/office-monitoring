@@ -1,6 +1,8 @@
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
@@ -93,6 +95,14 @@ class AppCategory(SQLModel, table=True):
     Назначается глобально (одно правило для всех агентов)."""
     id: int | None = Field(default=None, primary_key=True)
     app_name: str = Field(index=True, unique=True)
+    category: str  # work | personal | neutral
+    updated_at: datetime
+
+
+class DomainCategory(SQLModel, table=True):
+    """Категория веб-домена для активных вкладок в браузере."""
+    id: int | None = Field(default=None, primary_key=True)
+    domain: str = Field(index=True, unique=True)
     category: str  # work | personal | neutral
     updated_at: datetime
 
@@ -381,12 +391,10 @@ def get_active_meeting(agent_id: str) -> dict:
         }
 
 
-# ---------- app categories ----------
+# ---------- app + domain categories ----------
 
 # Дефолтный словарь категорий: ключи — app_name (как видит ОС), значения — категория.
-# Используется на лету пока пользователь не переопределил в БД.
 DEFAULT_CATEGORIES: dict[str, str] = {
-    # Корп. инструменты — work
     "AmoCRM": "work", "amoCRM": "work",
     "Outlook": "work", "Microsoft Outlook": "work",
     "Word": "work", "Microsoft Word": "work",
@@ -395,98 +403,209 @@ DEFAULT_CATEGORIES: dict[str, str] = {
     "Skorozvon": "work",
     "Zoom": "work", "zoom.us": "work",
     "Telemost": "work",
-    "Яндекс.Браузер": "work",
-    # Мессенджеры — neutral (могут быть рабочими, могут личными)
     "Telegram": "neutral", "Telegram Lite": "neutral",
     "WhatsApp": "neutral",
     "ВКонтакте": "neutral",
-    # Браузеры — neutral (зависит от сайта)
     "Google Chrome": "neutral", "Chrome": "neutral",
-    "Safari": "neutral",
-    "Firefox": "neutral",
-    "Microsoft Edge": "neutral",
-    # Системные/инструменты
+    "Safari": "neutral", "Firefox": "neutral", "Microsoft Edge": "neutral",
+    "Arc": "neutral", "Brave Browser": "neutral", "Yandex": "neutral",
     "Finder": "neutral", "Explorer": "neutral", "Windows Explorer": "neutral",
     "Terminal": "neutral", "iTerm2": "neutral", "Windows Terminal": "neutral",
     "System Settings": "neutral", "Системные настройки": "neutral",
-    # Личное
-    "YouTube": "personal",
-    "TikTok": "personal",
-    "Instagram": "personal",
-    "Spotify": "personal",
-    "Steam": "personal",
-    "Discord": "personal",
+    "YouTube": "personal", "TikTok": "personal", "Instagram": "personal",
+    "Spotify": "personal", "Steam": "personal", "Discord": "personal",
 }
+
+# Дефолтный словарь категорий доменов. Используется когда трекаем браузерную вкладку.
+DEFAULT_DOMAIN_CATEGORIES: dict[str, str] = {
+    # work
+    "amocrm.ru": "work", "amocrm.com": "work",
+    "bitrix24.ru": "work", "bitrix24.com": "work",
+    "gmail.com": "work", "mail.google.com": "work",
+    "outlook.live.com": "work", "outlook.office.com": "work", "outlook.office365.com": "work",
+    "docs.google.com": "work", "drive.google.com": "work", "sheets.google.com": "work",
+    "skorozvon.ru": "work",
+    "lkdzrkk.pro": "work", "office.lkdzrkk.pro": "work",
+    "github.com": "work", "gitlab.com": "work",
+    "notion.so": "work", "trello.com": "work", "asana.com": "work",
+    "office.com": "work",
+    "zoom.us": "work", "meet.google.com": "work", "telemost.yandex.ru": "work",
+    # personal
+    "youtube.com": "personal", "youtu.be": "personal", "m.youtube.com": "personal",
+    "tiktok.com": "personal",
+    "instagram.com": "personal",
+    "twitter.com": "personal", "x.com": "personal",
+    "reddit.com": "personal", "old.reddit.com": "personal",
+    "twitch.tv": "personal",
+    "spotify.com": "personal", "open.spotify.com": "personal", "music.yandex.ru": "personal",
+    "netflix.com": "personal", "kinopoisk.ru": "personal", "ivi.ru": "personal", "okko.tv": "personal",
+    "store.steampowered.com": "personal", "steamcommunity.com": "personal",
+    "discord.com": "personal",
+    "pikabu.ru": "personal", "habr.com": "personal",
+    "9gag.com": "personal", "joyreactor.cc": "personal",
+    # neutral (зависит от контекста)
+    "google.com": "neutral", "google.ru": "neutral",
+    "yandex.ru": "neutral", "ya.ru": "neutral",
+    "vk.com": "neutral", "m.vk.com": "neutral",
+    "t.me": "neutral", "web.telegram.org": "neutral", "telegram.org": "neutral",
+    "ozon.ru": "neutral", "wildberries.ru": "neutral", "avito.ru": "neutral",
+    "stackoverflow.com": "neutral",
+    "wikipedia.org": "neutral", "ru.wikipedia.org": "neutral", "en.wikipedia.org": "neutral",
+    "github.io": "neutral",
+}
+
+BROWSER_APPS = {
+    "Google Chrome", "Google Chrome Canary", "Chrome",
+    "Safari", "Firefox", "Microsoft Edge",
+    "Arc", "Brave Browser", "Yandex", "Яндекс.Браузер",
+}
+
+# title окон от агента приходит как «Page Title — https://example.com/page»
+_URL_IN_TITLE_RE = re.compile(r" — (https?://\S+)\s*$")
+
+
+def extract_url_from_title(title: str | None) -> str | None:
+    if not title:
+        return None
+    m = _URL_IN_TITLE_RE.search(title)
+    return m.group(1) if m else None
+
+
+def extract_domain(url: str | None) -> str | None:
+    if not url:
+        return None
+    try:
+        host = urlparse(url).hostname
+        if host and host.startswith("www."):
+            host = host[4:]
+        return host.lower() if host else None
+    except Exception:
+        return None
 
 
 def get_category_map(session: Session) -> dict[str, str]:
     """Объединяет дефолтный словарь с пользовательскими переопределениями."""
     merged = dict(DEFAULT_CATEGORIES)
-    user_rules = session.exec(select(AppCategory)).all()
-    for r in user_rules:
+    for r in session.exec(select(AppCategory)).all():
         merged[r.app_name] = r.category
     return merged
 
 
-class AppCategoryIn(BaseModel):
-    app_name: str
+def get_domain_category_map(session: Session) -> dict[str, str]:
+    merged = dict(DEFAULT_DOMAIN_CATEGORIES)
+    for r in session.exec(select(DomainCategory)).all():
+        merged[r.domain] = r.category
+    return merged
+
+
+def categorize_sample(app_name: str, title: str | None, app_map: dict, domain_map: dict) -> tuple[str, str, str]:
+    """Возвращает (display_name, category, target_kind).
+    target_kind = 'app' | 'domain' — для UI чтобы знать что менять в dropdown."""
+    app = app_name or "unknown"
+    if app in BROWSER_APPS:
+        url = extract_url_from_title(title)
+        domain = extract_domain(url)
+        if domain:
+            cat = domain_map.get(domain)
+            if cat is None:
+                # fallback на категорию приложения если домен не известен
+                cat = app_map.get(app, "neutral")
+            return f"{app} · {domain}", cat, "domain"
+    cat = app_map.get(app, "neutral")
+    return app, cat, "app"
+
+
+class CategoryIn(BaseModel):
+    name: str  # app_name или domain
     category: str  # work | personal | neutral
+    kind: str = "app"  # app | domain
 
 
 @app.get("/app_categories")
 def list_app_categories() -> dict:
-    """Все известные приложения с их категориями (дефолт + пользовательские)."""
     with Session(engine) as session:
-        merged = get_category_map(session)
-        user_overrides = {r.app_name for r in session.exec(select(AppCategory)).all()}
+        app_merged = get_category_map(session)
+        app_user = {r.app_name for r in session.exec(select(AppCategory)).all()}
+        domain_merged = get_domain_category_map(session)
+        domain_user = {r.domain for r in session.exec(select(DomainCategory)).all()}
     return {
-        "categories": [
-            {"app_name": k, "category": v, "user_defined": k in user_overrides}
-            for k, v in sorted(merged.items())
-        ]
+        "apps": [
+            {"name": k, "category": v, "user_defined": k in app_user}
+            for k, v in sorted(app_merged.items())
+        ],
+        "domains": [
+            {"name": k, "category": v, "user_defined": k in domain_user}
+            for k, v in sorted(domain_merged.items())
+        ],
     }
 
 
 @app.post("/app_categories")
-def set_app_category(payload: AppCategoryIn) -> dict:
+def set_app_category(payload: CategoryIn) -> dict:
     if payload.category not in ("work", "personal", "neutral"):
         raise HTTPException(400, "category должен быть work | personal | neutral")
+    if payload.kind not in ("app", "domain"):
+        raise HTTPException(400, "kind должен быть app или domain")
     now = datetime.now(timezone.utc)
     with Session(engine) as session:
-        existing = session.exec(select(AppCategory).where(AppCategory.app_name == payload.app_name)).first()
-        if existing:
-            existing.category = payload.category
-            existing.updated_at = now
-            session.add(existing)
+        if payload.kind == "domain":
+            existing = session.exec(select(DomainCategory).where(DomainCategory.domain == payload.name)).first()
+            if existing:
+                existing.category = payload.category
+                existing.updated_at = now
+                session.add(existing)
+            else:
+                session.add(DomainCategory(domain=payload.name, category=payload.category, updated_at=now))
         else:
-            session.add(AppCategory(app_name=payload.app_name, category=payload.category, updated_at=now))
+            existing = session.exec(select(AppCategory).where(AppCategory.app_name == payload.name)).first()
+            if existing:
+                existing.category = payload.category
+                existing.updated_at = now
+                session.add(existing)
+            else:
+                session.add(AppCategory(app_name=payload.name, category=payload.category, updated_at=now))
         session.commit()
-    return {"status": "ok", "app_name": payload.app_name, "category": payload.category}
+    return {"status": "ok", "kind": payload.kind, "name": payload.name, "category": payload.category}
 
 
 @app.get("/agents/{agent_id}/day_summary")
 def agent_day_summary(agent_id: str, hours: int = 24) -> dict:
-    """Свод дня менеджера: время по категориям + список приложений в каждой категории + время на встречах."""
+    """Свод дня менеджера: время по категориям + список приложений (с разбивкой
+    по доменам для браузеров) + время на встречах."""
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     with Session(engine) as session:
-        cat_map = get_category_map(session)
+        app_map = get_category_map(session)
+        domain_map = get_domain_category_map(session)
 
-        # окна по приложениям
-        rows = session.exec(
-            select(WindowSample.app_name, func.sum(WindowSample.duration_seconds))
+        # Для браузеров не можем тупо группировать в БД — title содержит URL,
+        # домены разные. Берём все сэмплы и группируем в Python.
+        samples = session.exec(
+            select(WindowSample.app_name, WindowSample.title, WindowSample.duration_seconds)
             .where(WindowSample.agent_id == agent_id)
             .where(WindowSample.captured_at >= since)
-            .group_by(WindowSample.app_name)
         ).all()
 
         by_category: dict[str, int] = {"work": 0, "personal": 0, "neutral": 0}
         by_app: dict[str, dict] = {}
-        for app_name, secs in rows:
-            app_name = app_name or "unknown"
+        for app_name, title, secs in samples:
             secs = int(secs or 0)
-            cat = cat_map.get(app_name, "neutral")
+            display, cat, kind = categorize_sample(app_name, title, app_map, domain_map)
             by_category[cat] = by_category.get(cat, 0) + secs
-            by_app[app_name] = {"seconds": secs, "category": cat}
+            if display not in by_app:
+                # target_name — что менять при изменении категории в UI
+                if kind == "domain":
+                    # display = "Google Chrome · youtube.com" → target = "youtube.com"
+                    target_name = display.split(" · ", 1)[1]
+                else:
+                    target_name = display
+                by_app[display] = {
+                    "seconds": secs,
+                    "category": cat,
+                    "target_kind": kind,
+                    "target_name": target_name,
+                }
+            else:
+                by_app[display]["seconds"] += secs
 
         # время на встречах
         meetings = session.exec(
@@ -515,6 +634,13 @@ def agent_day_summary(agent_id: str, hours: int = 24) -> dict:
             ],
             "meetings_count": len(meetings),
         }
+
+
+@app.post("/recategorize")
+def recategorize_old_data() -> dict:
+    """Пересчёт ничего не сохраняет — категории всегда вычисляются на лету.
+    Эндпоинт оставлен для совместимости/будущего использования."""
+    return {"status": "ok", "note": "категории вычисляются динамически, пересчёт не нужен"}
 
 
 # ---------- voice segments (always-on аудио) ----------

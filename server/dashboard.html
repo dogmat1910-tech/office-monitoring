@@ -514,10 +514,14 @@
         </div>
         ${d.by_app.map(item => {
           const pct = max > 0 ? (item.seconds / max * 100).toFixed(1) : 0;
+          const kindLabel = item.target_kind === 'domain' ? '🌐' : '📦';
           return `<div class="bar-row">
             <div class="name">
+              <span title="${item.target_kind === 'domain' ? 'веб-домен' : 'приложение'}">${kindLabel}</span>
               ${escapeHTML(item.app_name)}
-              <select class="cat-select" data-app="${escapeHTML(item.app_name)}">
+              <select class="cat-select"
+                      data-name="${escapeHTML(item.target_name)}"
+                      data-kind="${item.target_kind}">
                 <option value="work" ${item.category === 'work' ? 'selected' : ''}>работа</option>
                 <option value="neutral" ${item.category === 'neutral' ? 'selected' : ''}>нейтр.</option>
                 <option value="personal" ${item.category === 'personal' ? 'selected' : ''}>личное</option>
@@ -532,7 +536,11 @@
         await fetch("/app_categories", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ app_name: s.dataset.app, category: s.value }),
+          body: JSON.stringify({
+            name: s.dataset.name,
+            kind: s.dataset.kind,
+            category: s.value,
+          }),
         });
         loadAgentData();
       }));
