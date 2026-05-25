@@ -165,6 +165,7 @@ class VoiceSegment(SQLModel, table=True):
     classified_at: datetime | None = None
     meeting_id: int | None = Field(default=None, index=True)
     conversation_id: int | None = Field(default=None, index=True)
+    speaker_label: str | None = None  # SPEAKER_00, SPEAKER_01, ... после diarization
 
 
 class Conversation(SQLModel, table=True):
@@ -195,6 +196,11 @@ class Conversation(SQLModel, table=True):
     related_meeting_id: int | None = Field(default=None, index=True)
     # matched | missed_button | no_recording | standalone
     sync_status: str | None = Field(default=None, index=True)
+
+    # Diarization (заполняется отдельным этапом воркера):
+    speakers_count: int | None = None
+    speakers_timeline_json: str | None = None  # сохранённый список turns
+    diarized_at: datetime | None = None
 
 
 class HeartbeatIn(BaseModel):

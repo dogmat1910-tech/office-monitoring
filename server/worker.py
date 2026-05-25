@@ -25,6 +25,7 @@ from analyze_conversation import analyze_conversation
 from classify_voice import auto_bind_meeting_id, classify_voice_segment
 from conversations import cluster_pending_segments, get_active_agents_with_pending_segments
 from daily_report import generate_daily_report
+from diarization import diarize_conversation
 from transcribe import get_model, transcribe_meeting, transcribe_voice_segment
 
 logging.basicConfig(
@@ -121,6 +122,56 @@ def process_conversation_analysis(conv_id: int) -> None:
                 c.summary = f"[ошибка анализа: {e}]"[:200]
                 c.analyzed_at = datetime.now(timezone.utc)
                 session.add(c)
+                session.commit()
+
+
+def find_pending_diarization() -> int | None:
+    """Conversation с проанализированным LLM (kind не None и не noise),
+    но без diarization (diarized_at IS NULL)."""
+    from main import Conversation
+    with Session(engine) as session:
+        c = session.exec(
+            select(Conversation)
+            .where(Conversation.kind.is_not(None))
+            .where(Conversation.kind != "noise")
+            .where(Conversation.diarized_at.is_(None))
+            .where(Conversation.duration_seconds >= 5)  # пропускаем очень короткие
+            .order_by(Conversation.started_at)
+        ).first()
+        return c.id if c else None
+
+
+def process_diarization(conv_id: int) -> None:
+    from main import Conversation, VoiceSegment
+    import json as _json
+    try:
+        log.info("conversation %d: diarization старт", conv_id)
+        result = diarize_conversation(conv_id)
+        with Session(engine) as session:
+            conv = session.exec(select(Conversation).where(Conversation.id == conv_id)).first()
+            if conv is None:
+                return
+            conv.speakers_count = result.get("speakers_count", 0)
+            conv.speakers_timeline_json = _json.dumps(result.get("timeline", []), ensure_ascii=False)
+            conv.diarized_at = datetime.now(timezone.utc)
+            session.add(conv)
+
+            for seg_id, speaker in result.get("segment_speakers", []):
+                seg = session.exec(select(VoiceSegment).where(VoiceSegment.id == seg_id)).first()
+                if seg:
+                    seg.speaker_label = speaker
+                    session.add(seg)
+            session.commit()
+        log.info("conversation %d: diarized speakers=%d", conv_id, result.get("speakers_count", 0))
+    except Exception as e:
+        log.exception("conversation %d: ошибка diarization: %s", conv_id, e)
+        # помечаем что попытались чтобы не зацикливаться
+        with Session(engine) as session:
+            conv = session.exec(select(Conversation).where(Conversation.id == conv_id)).first()
+            if conv:
+                conv.diarized_at = datetime.now(timezone.utc)
+                conv.speakers_count = 0
+                session.add(conv)
                 session.commit()
 
 
@@ -351,6 +402,13 @@ def process_one() -> bool:
     if conv_id is not None:
         process_conversation_analysis(conv_id)
         return True
+
+    # Этап 2.9: speaker diarization для conversation
+    if os.environ.get("OM_ENABLE_DIARIZATION", "1") == "1":
+        conv_id = find_pending_diarization()
+        if conv_id is not None:
+            process_diarization(conv_id)
+            return True
 
     # Этап 3: pending daily reports
     pending_report = find_pending_daily_report()
