@@ -19,8 +19,9 @@ from pathlib import Path
 from sqlmodel import Session, select
 
 # импорт моделей и engine из main.py
-from main import AUDIO_DIR, VOICE_DIR, Analysis, AudioChunk, Meeting, Transcript, VoiceSegment, engine
+from main import AUDIO_DIR, VOICE_DIR, Analysis, AudioChunk, DailyReport, Meeting, Transcript, VoiceSegment, engine
 from analyze import analyze_transcript
+from daily_report import generate_daily_report
 from transcribe import get_model, transcribe_meeting, transcribe_voice_segment
 
 logging.basicConfig(
@@ -68,6 +69,42 @@ def find_pending_voice_segment() -> int | None:
             .order_by(VoiceSegment.started_at)
         ).first()
         return seg.id if seg else None
+
+
+def find_pending_daily_report() -> int | None:
+    with Session(engine) as session:
+        rep = session.exec(
+            select(DailyReport).where(DailyReport.status == "pending").order_by(DailyReport.requested_at)
+        ).first()
+        return rep.id if rep else None
+
+
+def process_daily_report(report_id: int) -> None:
+    import json as _json
+    with Session(engine) as session:
+        rep = session.exec(select(DailyReport).where(DailyReport.id == report_id)).first()
+        if rep is None:
+            return
+        log.info("daily_report %s/%s: старт генерации", rep.agent_id, rep.report_date)
+        try:
+            result = generate_daily_report(rep.agent_id, rep.report_date)
+            meta = result.pop("_meta", {})
+            rep.status = "done"
+            rep.payload_json = _json.dumps(result, ensure_ascii=False)
+            rep.productivity_score = result.get("productivity_score")
+            rep.model = meta.get("model")
+            rep.processing_time_seconds = meta.get("processing_time_seconds")
+            rep.completed_at = datetime.now(timezone.utc)
+            session.add(rep)
+            session.commit()
+            log.info("daily_report %s/%s: готов (score=%s)", rep.agent_id, rep.report_date, rep.productivity_score)
+        except Exception as e:
+            log.exception("daily_report %s/%s: ошибка: %s", rep.agent_id, rep.report_date, e)
+            rep.status = "error"
+            rep.error_message = str(e)[:500]
+            rep.completed_at = datetime.now(timezone.utc)
+            session.add(rep)
+            session.commit()
 
 
 def process_voice_segment(segment_id: int) -> None:
@@ -182,7 +219,13 @@ def process_one() -> bool:
         process_voice_segment(seg_id)
         return True
 
-    # Этап 3: LLM-анализ
+    # Этап 3: pending daily reports
+    pending_report = find_pending_daily_report()
+    if pending_report is not None:
+        process_daily_report(pending_report)
+        return True
+
+    # Этап 4: LLM-анализ встреч
     meeting_id = find_pending_analysis()
     if meeting_id is not None:
         text = get_transcript_text(meeting_id)

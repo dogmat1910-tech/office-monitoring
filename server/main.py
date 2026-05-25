@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -105,6 +106,21 @@ class DomainCategory(SQLModel, table=True):
     domain: str = Field(index=True, unique=True)
     category: str  # work | personal | neutral
     updated_at: datetime
+
+
+class DailyReport(SQLModel, table=True):
+    """LLM-разбор дня менеджера: встречи, звонки, прокрастинация, оценка."""
+    id: int | None = Field(default=None, primary_key=True)
+    agent_id: str = Field(index=True)
+    report_date: str = Field(index=True)  # YYYY-MM-DD по локальному дню менеджера
+    status: str = Field(index=True)  # pending | done | error
+    payload_json: str | None = None  # JSON от LLM
+    productivity_score: int | None = None
+    model: str | None = None
+    requested_at: datetime
+    completed_at: datetime | None = None
+    processing_time_seconds: float | None = None
+    error_message: str | None = None
 
 
 class VoiceSegment(SQLModel, table=True):
@@ -638,9 +654,88 @@ def agent_day_summary(agent_id: str, hours: int = 24) -> dict:
 
 @app.post("/recategorize")
 def recategorize_old_data() -> dict:
-    """Пересчёт ничего не сохраняет — категории всегда вычисляются на лету.
-    Эндпоинт оставлен для совместимости/будущего использования."""
+    """Пересчёт ничего не сохраняет — категории всегда вычисляются на лету."""
     return {"status": "ok", "note": "категории вычисляются динамически, пересчёт не нужен"}
+
+
+# ---------- Daily Report ----------
+
+@app.post("/agents/{agent_id}/daily_report")
+def request_daily_report(agent_id: str, date: str) -> dict:
+    """Создаёт pending-запись отчёта (или возвращает существующий). Воркер генерирует."""
+    # валидация даты
+    try:
+        datetime.fromisoformat(date)
+    except ValueError:
+        raise HTTPException(400, "date должен быть YYYY-MM-DD")
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        existing = session.exec(
+            select(DailyReport).where(DailyReport.agent_id == agent_id, DailyReport.report_date == date)
+        ).first()
+        if existing:
+            if existing.status == "done":
+                return {"status": "done", "report_id": existing.id, "regenerated": False}
+            if existing.status == "pending":
+                return {"status": "pending", "report_id": existing.id}
+            # error → пересоздаём
+            session.delete(existing)
+            session.commit()
+        rep = DailyReport(
+            agent_id=agent_id,
+            report_date=date,
+            status="pending",
+            requested_at=now,
+        )
+        session.add(rep)
+        session.commit()
+        session.refresh(rep)
+        return {"status": "pending", "report_id": rep.id}
+
+
+@app.post("/agents/{agent_id}/daily_report/regenerate")
+def regenerate_daily_report(agent_id: str, date: str) -> dict:
+    """Удаляет существующий отчёт и просит новый."""
+    try:
+        datetime.fromisoformat(date)
+    except ValueError:
+        raise HTTPException(400, "date должен быть YYYY-MM-DD")
+    with Session(engine) as session:
+        existing = session.exec(
+            select(DailyReport).where(DailyReport.agent_id == agent_id, DailyReport.report_date == date)
+        ).first()
+        if existing:
+            session.delete(existing)
+            session.commit()
+    return request_daily_report(agent_id, date)
+
+
+@app.get("/agents/{agent_id}/daily_report")
+def get_daily_report(agent_id: str, date: str) -> dict:
+    try:
+        datetime.fromisoformat(date)
+    except ValueError:
+        raise HTTPException(400, "date должен быть YYYY-MM-DD")
+    with Session(engine) as session:
+        rep = session.exec(
+            select(DailyReport).where(DailyReport.agent_id == agent_id, DailyReport.report_date == date)
+        ).first()
+        if rep is None:
+            return {"status": "absent", "agent_id": agent_id, "date": date}
+        payload = json.loads(rep.payload_json) if rep.payload_json else None
+        return {
+            "status": rep.status,
+            "report_id": rep.id,
+            "agent_id": rep.agent_id,
+            "date": rep.report_date,
+            "requested_at": _as_utc(rep.requested_at).isoformat(),
+            "completed_at": _as_utc(rep.completed_at).isoformat() if rep.completed_at else None,
+            "model": rep.model,
+            "productivity_score": rep.productivity_score,
+            "processing_time_seconds": rep.processing_time_seconds,
+            "error_message": rep.error_message,
+            "payload": payload,
+        }
 
 
 # ---------- voice segments (always-on аудио) ----------
@@ -763,7 +858,6 @@ async def upload_audio_chunk(
 
 @app.get("/meetings/{meeting_id}/analysis")
 def get_meeting_analysis(meeting_id: int) -> dict:
-    import json as _json
     with Session(engine) as session:
         a = session.exec(select(Analysis).where(Analysis.meeting_id == meeting_id)).first()
         if a is None:
@@ -775,7 +869,7 @@ def get_meeting_analysis(meeting_id: int) -> dict:
             "model": a.model,
             "analyzed_at": _as_utc(a.analyzed_at).isoformat(),
             "processing_time_seconds": a.processing_time_seconds,
-            **_json.loads(a.payload_json),
+            **json.loads(a.payload_json),
         }
 
 
