@@ -1,9 +1,13 @@
 """
-office-monitoring agent — Шаг 1: heartbeat.
+office-monitoring agent.
 
-Раз в HEARTBEAT_INTERVAL секунд агент сообщает серверу что жив.
-Сервер: SERVER_URL (читается из env OM_SERVER_URL, по умолчанию localhost).
+Шаг 1: heartbeat — раз в FLUSH_INTERVAL агент сообщает серверу что жив.
+Шаг 2: трекинг активного окна — каждые SAMPLE_INTERVAL агент смотрит,
+       какое окно сейчас активно. Накопленные сэмплы отправляются на сервер
+       вместе со следующим heartbeat'ом.
 """
+
+from __future__ import annotations
 
 import getpass
 import hashlib
@@ -13,13 +17,17 @@ import platform
 import socket
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 
-AGENT_VERSION = "0.1.0"
+from active_window import get_active_window
+
+AGENT_VERSION = "0.2.0"
 SERVER_URL = os.environ.get("OM_SERVER_URL", "http://127.0.0.1:8000").rstrip("/")
-HEARTBEAT_INTERVAL = int(os.environ.get("OM_HEARTBEAT_INTERVAL", "30"))
+SAMPLE_INTERVAL = int(os.environ.get("OM_SAMPLE_INTERVAL", "5"))    # как часто смотреть на активное окно
+FLUSH_INTERVAL = int(os.environ.get("OM_FLUSH_INTERVAL", "30"))     # как часто слать heartbeat + накопленные сэмплы
 
 LOG_DIR = Path(os.environ.get("OM_LOG_DIR", str(Path.home() / ".office-monitoring")))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -30,12 +38,42 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
 )
+# глушим debug-логи httpx — слишком много шума на каждый запрос
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("agent")
 
 
 def make_agent_id(hostname: str, username: str) -> str:
     raw = f"{hostname}::{username}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
+
+
+class WindowBuffer:
+    """Аккумулирует время по уникальным (app_name, title)."""
+
+    def __init__(self) -> None:
+        self._buf: dict[tuple[str, str], int] = {}
+        self._first_seen: dict[tuple[str, str], datetime] = {}
+
+    def add(self, app_name: str, title: str, seconds: int) -> None:
+        key = (app_name, title)
+        self._buf[key] = self._buf.get(key, 0) + seconds
+        if key not in self._first_seen:
+            self._first_seen[key] = datetime.now(timezone.utc)
+
+    def flush(self) -> list[dict]:
+        result = [
+            {
+                "app_name": app,
+                "title": title,
+                "captured_at": self._first_seen[(app, title)].isoformat(),
+                "duration_seconds": secs,
+            }
+            for (app, title), secs in self._buf.items()
+        ]
+        self._buf.clear()
+        self._first_seen.clear()
+        return result
 
 
 def send_heartbeat(client: httpx.Client, agent_id: str, hostname: str, username: str) -> bool:
@@ -51,10 +89,25 @@ def send_heartbeat(client: httpx.Client, agent_id: str, hostname: str, username:
             timeout=10.0,
         )
         r.raise_for_status()
-        log.info("heartbeat ok: %s", r.json())
         return True
     except Exception as e:
         log.warning("heartbeat failed: %s", e)
+        return False
+
+
+def send_window_samples(client: httpx.Client, agent_id: str, samples: list[dict]) -> bool:
+    if not samples:
+        return True
+    try:
+        r = client.post(
+            f"{SERVER_URL}/window_samples",
+            json={"agent_id": agent_id, "samples": samples},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        log.warning("window_samples failed (%d samples buffered): %s", len(samples), e)
         return False
 
 
@@ -64,19 +117,35 @@ def main() -> None:
     agent_id = make_agent_id(hostname, username)
 
     log.info(
-        "agent starting: version=%s os=%s hostname=%s username=%s agent_id=%s server=%s",
+        "agent starting: version=%s os=%s hostname=%s username=%s agent_id=%s server=%s sample=%ds flush=%ds",
         AGENT_VERSION,
         platform.platform(),
         hostname,
         username,
         agent_id,
         SERVER_URL,
+        SAMPLE_INTERVAL,
+        FLUSH_INTERVAL,
     )
+
+    buffer = WindowBuffer()
+    last_flush = time.monotonic()
 
     with httpx.Client() as client:
         while True:
-            send_heartbeat(client, agent_id, hostname, username)
-            time.sleep(HEARTBEAT_INTERVAL)
+            window = get_active_window()
+            if window is not None:
+                buffer.add(window["app_name"], window["title"], SAMPLE_INTERVAL)
+
+            now = time.monotonic()
+            if now - last_flush >= FLUSH_INTERVAL:
+                samples = buffer.flush()
+                ok_hb = send_heartbeat(client, agent_id, hostname, username)
+                ok_ws = send_window_samples(client, agent_id, samples)
+                log.info("flush: heartbeat=%s window_samples=%d ok=%s", ok_hb, len(samples), ok_ws)
+                last_flush = now
+
+            time.sleep(SAMPLE_INTERVAL)
 
 
 if __name__ == "__main__":
