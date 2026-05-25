@@ -661,6 +661,127 @@ def recategorize_old_data() -> dict:
     return {"status": "ok", "note": "категории вычисляются динамически, пересчёт не нужен"}
 
 
+# ---------- Команда (overview всех агентов) ----------
+
+@app.get("/overview")
+def team_overview(hours: int = 24) -> dict:
+    """Свод по всем агентам за период hours: для главного экрана.
+    Возвращает по каждому агенту: статус online, разбивка времени по категориям,
+    кол-во встреч + средняя оценка, продуктивность из последнего daily report,
+    кол-во голос-сегментов с разбивкой по kind."""
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(hours=hours)
+    today_str = now.strftime("%Y-%m-%d")
+
+    with Session(engine) as session:
+        agents = session.exec(select(Agent).order_by(Agent.last_seen.desc())).all()
+        app_map = get_category_map(session)
+        domain_map = get_domain_category_map(session)
+
+        # Активные встречи — для бейджа
+        active_meetings = session.exec(select(Meeting).where(Meeting.ended_at.is_(None))).all()
+        active_by_agent = {m.agent_id: m for m in active_meetings}
+
+        result = []
+        for a in agents:
+            last_seen = _as_utc(a.last_seen)
+            online = (now - last_seen).total_seconds() < 60
+
+            # окна → категории
+            samples = session.exec(
+                select(WindowSample.app_name, WindowSample.title, WindowSample.duration_seconds)
+                .where(WindowSample.agent_id == a.agent_id)
+                .where(WindowSample.captured_at >= since)
+            ).all()
+            by_cat = {"work": 0, "personal": 0, "neutral": 0}
+            for app_name, title, secs in samples:
+                _, cat, _ = categorize_sample(app_name, title, app_map, domain_map)
+                by_cat[cat] = by_cat.get(cat, 0) + int(secs or 0)
+
+            # встречи
+            meetings = session.exec(
+                select(Meeting)
+                .where(Meeting.agent_id == a.agent_id)
+                .where(Meeting.started_at >= since)
+            ).all()
+            meeting_seconds = sum(
+                int((_as_utc(m.ended_at) - _as_utc(m.started_at)).total_seconds())
+                for m in meetings if m.ended_at
+            )
+            # средняя оценка по завершённым встречам за период
+            meeting_ids = [m.id for m in meetings if m.id]
+            scores = []
+            if meeting_ids:
+                analyses = session.exec(
+                    select(Analysis).where(Analysis.meeting_id.in_(meeting_ids))
+                ).all()
+                scores = [an.final_score for an in analyses if an.final_score is not None]
+            avg_meeting_score = round(sum(scores) / len(scores), 1) if scores else None
+
+            # голос
+            voice = session.exec(
+                select(VoiceSegment.kind, func.count(VoiceSegment.id), func.sum(VoiceSegment.duration_seconds))
+                .where(VoiceSegment.agent_id == a.agent_id)
+                .where(VoiceSegment.started_at >= since)
+                .group_by(VoiceSegment.kind)
+            ).all()
+            voice_by_kind = {(k or "unclassified"): {"count": int(n or 0), "seconds": int(s or 0)} for k, n, s in voice}
+            voice_total_seconds = sum(v["seconds"] for v in voice_by_kind.values())
+
+            # последний daily report (сегодня)
+            daily = session.exec(
+                select(DailyReport)
+                .where(DailyReport.agent_id == a.agent_id)
+                .where(DailyReport.report_date == today_str)
+            ).first()
+            daily_score = daily.productivity_score if daily and daily.status == "done" else None
+            daily_status = daily.status if daily else None
+            red_flags_count = 0
+            if daily and daily.payload_json:
+                try:
+                    payload = json.loads(daily.payload_json)
+                    red_flags_count = len(payload.get("red_flags") or [])
+                except Exception:
+                    pass
+
+            result.append({
+                "agent_id": a.agent_id,
+                "hostname": a.hostname,
+                "username": a.username,
+                "online": online,
+                "last_seen": last_seen.isoformat(),
+                "active_meeting": (
+                    {"started_at": _as_utc(active_by_agent[a.agent_id].started_at).isoformat(),
+                     "client_name": active_by_agent[a.agent_id].client_name}
+                    if a.agent_id in active_by_agent else None
+                ),
+                "by_category": by_cat,
+                "meeting_seconds": meeting_seconds,
+                "meetings_count": len(meetings),
+                "avg_meeting_score": avg_meeting_score,
+                "voice_total_seconds": voice_total_seconds,
+                "voice_by_kind": voice_by_kind,
+                "daily_score": daily_score,
+                "daily_status": daily_status,
+                "red_flags_count": red_flags_count,
+            })
+
+        # Сортировка: онлайн сначала, далее по daily_score asc (худшие сверху)
+        result.sort(key=lambda x: (
+            not x["online"],
+            x["daily_score"] if x["daily_score"] is not None else 999,
+            -x["meetings_count"],
+        ))
+
+        return {
+            "hours": hours,
+            "now": now.isoformat(),
+            "total_agents": len(result),
+            "online_count": sum(1 for r in result if r["online"]),
+            "agents": result,
+        }
+
+
 # ---------- Daily Report ----------
 
 @app.post("/agents/{agent_id}/daily_report")

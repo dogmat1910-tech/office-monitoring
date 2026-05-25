@@ -205,6 +205,73 @@
       line-height: 1.6; white-space: pre-wrap; font-size: 13px; margin-top: 8px;
     }
 
+    /* Team overview */
+    .team-toolbar {
+      display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap;
+    }
+    .team-toolbar select, .team-toolbar input[type="checkbox"] {
+      background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+      border-radius: 6px; padding: 4px 8px; font-size: 13px;
+    }
+    .team-row {
+      display: grid;
+      grid-template-columns: 24px 220px 1fr 90px 90px 60px;
+      gap: 10px;
+      padding: 10px 12px;
+      align-items: center;
+      cursor: pointer;
+      border-bottom: 1px solid var(--border);
+      transition: background 0.1s;
+    }
+    .team-row:hover { background: rgba(56, 189, 248, 0.06); }
+    .team-row.header {
+      cursor: default;
+      background: transparent;
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      border-bottom: 2px solid var(--border);
+    }
+    .team-row.header:hover { background: transparent; }
+    .team-name { font-weight: 600; }
+    .team-name .meta { color: var(--muted); font-size: 11px; font-weight: 400; margin-top: 2px; }
+    .team-stack {
+      display: flex;
+      height: 16px;
+      border-radius: 4px;
+      overflow: hidden;
+      background: var(--panel-2);
+    }
+    .team-stack > div { height: 100%; }
+    .team-stack .work { background: #4ade80; }
+    .team-stack .meeting { background: #fbbf24; }
+    .team-stack .personal { background: #f87171; }
+    .team-stack .neutral { background: #475569; }
+    .team-stack-labels {
+      display: flex; justify-content: space-between; font-size: 11px;
+      color: var(--muted); margin-top: 3px; font-variant-numeric: tabular-nums;
+    }
+    .team-meetings { text-align: right; font-variant-numeric: tabular-nums; }
+    .team-meetings .num { font-weight: 600; }
+    .team-meetings .meta { font-size: 11px; color: var(--muted); }
+    .team-score {
+      display: flex; align-items: center; justify-content: center;
+      width: 50px; height: 50px; border-radius: 50%;
+      font-weight: 700; font-size: 16px; border: 2px solid var(--border);
+      margin: 0 auto;
+    }
+    .team-score.low { background: #7f1d1d; border-color: #b91c1c; color: #fecaca; }
+    .team-score.mid { background: #92400e; border-color: #d97706; color: #fde68a; }
+    .team-score.high { background: #14532d; border-color: #16a34a; color: #bbf7d0; }
+    .team-score.absent { background: transparent; color: var(--muted); font-size: 12px; font-weight: 500; }
+    .team-redflags {
+      text-align: center;
+      font-weight: 600;
+      color: #f87171;
+    }
+    .team-redflags.zero { color: var(--muted); font-weight: 400; }
+
     /* Daily Report */
     .daily-controls { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; }
     .daily-controls input[type="date"] {
@@ -309,12 +376,35 @@
 
       <!-- Tab navigation -->
       <nav class="tabs">
-        <button class="tab active" data-tab="today">Сегодня</button>
+        <button class="tab active" data-tab="team">👥 Команда</button>
+        <button class="tab" data-tab="today">Сегодня</button>
         <button class="tab" data-tab="meetings">Встречи</button>
         <button class="tab" data-tab="voice">Голос</button>
         <button class="tab" data-tab="windows">Окна</button>
         <button class="tab" data-tab="daily">Daily Report</button>
       </nav>
+
+      <!-- Tab: Команда -->
+      <div class="tab-content" data-tab-content="team">
+        <div class="panel">
+          <div class="team-toolbar">
+            <h2 style="margin: 0;">Команда</h2>
+            <div class="muted" id="teamMeta"></div>
+            <div style="flex: 1;"></div>
+            <label class="muted">Сортировка:
+              <select id="teamSort">
+                <option value="default">Худшие сверху</option>
+                <option value="score_desc">Лучшие сверху</option>
+                <option value="personal_desc">Больше прокрастинации</option>
+                <option value="meetings_desc">Больше встреч</option>
+                <option value="hostname">По имени</option>
+              </select>
+            </label>
+            <label class="muted"><input type="checkbox" id="teamOnlyOnline"> только online</label>
+          </div>
+          <div id="teamTable"></div>
+        </div>
+      </div>
 
       <!-- Tab: Сегодня — детальный барчарт приложений и доменов -->
       <div class="tab-content" data-tab-content="today">
@@ -392,6 +482,17 @@
       localStorage.setItem("omTab", name);
       $$(".tab").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
       $$(".tab-content").forEach(c => c.hidden = c.dataset.tabContent !== name);
+      // sticky-плитки релевантны только для конкретного агента, не для команды
+      const sticky = document.querySelector(".day-summary-sticky");
+      if (sticky) sticky.style.display = (name === "team") ? "none" : "";
+      // подгрузка данных вкладок
+      if (name === "team") {
+        loadTeam();
+      } else if (name === "daily" && selectedAgent) {
+        pollDailyReport(selectedAgent, $("#dailyDate").value);
+      } else {
+        clearDailyPoll();
+      }
     }
     $$(".tab").forEach(b => b.addEventListener("click", () => applyTab(b.dataset.tab)));
     applyTab(activeTab);
@@ -709,6 +810,114 @@
       </table>`;
     }
 
+    // ───────────── Tab: Команда (overview всех агентов) ─────────────
+    let teamPollTimer = null;
+    let teamData = null;
+
+    async function loadTeam() {
+      const hours = $("#hours").value;
+      try {
+        const r = await fetch(`/overview?hours=${hours}`);
+        teamData = await r.json();
+        renderTeam();
+      } catch (e) {
+        $("#teamTable").innerHTML = `<div class="empty">ошибка загрузки: ${e}</div>`;
+      }
+    }
+
+    function teamScoreClass(s) {
+      if (s == null) return "absent";
+      if (s <= 4) return "low";
+      if (s <= 7) return "mid";
+      return "high";
+    }
+
+    function renderTeam() {
+      if (!teamData) return;
+      const onlyOnline = $("#teamOnlyOnline").checked;
+      const sortBy = $("#teamSort").value;
+      let agents = teamData.agents.slice();
+      if (onlyOnline) agents = agents.filter(a => a.online);
+
+      const sortKey = (a) => {
+        switch (sortBy) {
+          case "score_desc": return -(a.daily_score ?? -1);
+          case "personal_desc": return -(a.by_category?.personal ?? 0);
+          case "meetings_desc": return -a.meetings_count;
+          case "hostname": return a.hostname.toLowerCase();
+          default: return (a.daily_score ?? 999) - (a.online ? 0 : 1000); // худшие online сверху
+        }
+      };
+      agents.sort((x, y) => {
+        const kx = sortKey(x), ky = sortKey(y);
+        return kx < ky ? -1 : kx > ky ? 1 : 0;
+      });
+
+      $("#teamMeta").textContent =
+        `${teamData.online_count}/${teamData.total_agents} онлайн · период: ${teamData.hours} ч`;
+
+      const head = `
+        <div class="team-row header">
+          <div></div>
+          <div>Менеджер</div>
+          <div>Распределение времени</div>
+          <div>Встречи</div>
+          <div style="text-align:center">Оценка дня</div>
+          <div style="text-align:center">🚨</div>
+        </div>`;
+
+      const rows = agents.map(a => {
+        const total = (a.by_category.work || 0) + (a.by_category.personal || 0) + (a.by_category.neutral || 0) + (a.meeting_seconds || 0);
+        const pct = (s) => total > 0 ? (s / total * 100).toFixed(1) + "%" : "0%";
+        const fmt = (s) => fmtSec(s);
+        const meetingBadge = a.active_meeting ? '<span class="badge meeting">🔴 встреча</span>' : '';
+        const scoreCls = teamScoreClass(a.daily_score);
+        const scoreLabel = a.daily_score != null
+          ? a.daily_score
+          : (a.daily_status === "pending" ? "⏳" : "—");
+        const rfCls = a.red_flags_count > 0 ? "" : "zero";
+        return `
+          <div class="team-row" data-id="${a.agent_id}">
+            <div><span class="dot ${a.online ? 'online' : 'offline'}"></span></div>
+            <div class="team-name">
+              ${escapeHTML(a.hostname)}${meetingBadge}
+              <div class="meta">${escapeHTML(a.username)} · ${a.online ? 'online' : 'offline'}</div>
+            </div>
+            <div>
+              <div class="team-stack" title="работа ${fmt(a.by_category.work)} · встречи ${fmt(a.meeting_seconds)} · нейтр. ${fmt(a.by_category.neutral)} · личное ${fmt(a.by_category.personal)}">
+                <div class="work" style="width:${pct(a.by_category.work)}"></div>
+                <div class="meeting" style="width:${pct(a.meeting_seconds)}"></div>
+                <div class="neutral" style="width:${pct(a.by_category.neutral)}"></div>
+                <div class="personal" style="width:${pct(a.by_category.personal)}"></div>
+              </div>
+              <div class="team-stack-labels">
+                <span>работа ${fmt(a.by_category.work)}</span>
+                <span>встр. ${fmt(a.meeting_seconds)}</span>
+                <span>личн. ${fmt(a.by_category.personal)}</span>
+              </div>
+            </div>
+            <div class="team-meetings">
+              <div class="num">${a.meetings_count}</div>
+              <div class="meta">${a.avg_meeting_score != null ? "ср. " + a.avg_meeting_score + "/10" : "—"}</div>
+            </div>
+            <div><div class="team-score ${scoreCls}">${scoreLabel}</div></div>
+            <div class="team-redflags ${rfCls}">${a.red_flags_count || 0}</div>
+          </div>`;
+      }).join("");
+
+      $("#teamTable").innerHTML = head + (rows || '<div class="empty">нет агентов</div>');
+
+      $$(".team-row[data-id]").forEach(row => row.addEventListener("click", () => {
+        selectedAgent = row.dataset.id;
+        loadAgents();
+        loadAgentData();
+        applyTab("today");
+      }));
+    }
+
+    $("#teamSort").addEventListener("change", renderTeam);
+    $("#teamOnlyOnline").addEventListener("change", renderTeam);
+
     // ───────────── Tab: Daily Report ─────────────
     let dailyPollTimer = null;
 
@@ -864,19 +1073,6 @@
       if (selectedAgent) pollDailyReport(selectedAgent, $("#dailyDate").value);
     });
 
-    // при переключении на вкладку daily — автоматом подгружаем отчёт за выбранную дату
-    const origApplyTab = applyTab;
-    applyTab = function(name) {
-      origApplyTab(name);
-      if (name === "daily" && selectedAgent) {
-        pollDailyReport(selectedAgent, $("#dailyDate").value);
-      } else {
-        clearDailyPoll();
-      }
-    };
-    $$(".tab").forEach(b => b.removeEventListener("click", () => {}));  // no-op, прежний listener уже стоит на origApplyTab
-    $$(".tab").forEach(b => b.addEventListener("click", () => applyTab(b.dataset.tab)));
-
     // ───────────── Init ─────────────
     const savedToken = localStorage.getItem("omToken");
     if (savedToken) $("#apiToken").value = savedToken;
@@ -886,7 +1082,11 @@
     $("#hours").addEventListener("change", loadAgentData);
 
     loadAgents();
-    setInterval(() => { loadAgents(); loadAgentData(); }, 30000);
+    setInterval(() => {
+      loadAgents();
+      if (selectedAgent) loadAgentData();
+      if (activeTab === "team") loadTeam();
+    }, 30000);
   </script>
 </body>
 </html>
