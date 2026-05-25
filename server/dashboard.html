@@ -136,6 +136,11 @@
         <h2 style="margin-top: 0;">Встречи</h2>
         <div id="meetings"></div>
       </div>
+      <div class="panel" id="transcriptPanel" style="display:none">
+        <h2 style="margin-top: 0;">Транскрипт встречи <span id="transcriptMeetingId" class="muted"></span></h2>
+        <div id="transcriptMeta" class="muted" style="font-size: 12px; margin-bottom: 10px;"></div>
+        <div id="transcriptText" style="line-height: 1.6; white-space: pre-wrap;"></div>
+      </div>
       <div class="panel">
         <h2 style="margin-top: 0;">Последние окна</h2>
         <div id="windows"></div>
@@ -262,10 +267,11 @@
       const el = $("#meetings");
       if (!meetings.length) {
         el.innerHTML = '<div class="empty">встреч пока нет</div>';
+        $("#transcriptPanel").style.display = "none";
         return;
       }
       el.innerHTML = `<table>
-        <thead><tr><th>Начало</th><th>Конец</th><th>Длительность</th><th>Клиент</th><th>ID</th></tr></thead>
+        <thead><tr><th>Начало</th><th>Конец</th><th>Длит.</th><th>Клиент</th><th>ID</th><th></th></tr></thead>
         <tbody>${meetings.map(m => `
           <tr>
             <td>${fmtTime(m.started_at)}</td>
@@ -273,8 +279,30 @@
             <td class="num">${m.duration_seconds != null ? fmtSec(m.duration_seconds) : '—'}</td>
             <td>${escapeHTML(m.client_name || '—')}</td>
             <td class="muted">${m.meeting_id}</td>
+            <td>${m.ended_at ? `<button class="btn-sim" data-tx="${m.meeting_id}">транскрипт</button>` : ''}</td>
           </tr>`).join("")}</tbody>
       </table>`;
+      el.querySelectorAll("[data-tx]").forEach(b => b.addEventListener("click", () => loadTranscript(b.dataset.tx)));
+    }
+
+    async function loadTranscript(meetingId) {
+      const r = await fetch(`/meetings/${meetingId}/transcript`);
+      const d = await r.json();
+      const panel = $("#transcriptPanel");
+      panel.style.display = "block";
+      $("#transcriptMeetingId").textContent = "#" + meetingId;
+      if (d.status === "pending") {
+        $("#transcriptMeta").textContent = "транскрипция в процессе — обнови через 10-30 сек";
+        $("#transcriptText").innerHTML = '<div class="empty">⏳ ждём воркера...</div>';
+        return;
+      }
+      const procRatio = d.duration_seconds && d.processing_time_seconds
+        ? (d.duration_seconds / d.processing_time_seconds).toFixed(1) + "x realtime"
+        : "";
+      $("#transcriptMeta").textContent =
+        `модель: ${d.model} · язык: ${d.language || "?"} · длительность: ${fmtSec(Math.round(d.duration_seconds || 0))} · обработано за ${(d.processing_time_seconds || 0).toFixed(1)} с (${procRatio})`;
+      $("#transcriptText").textContent = d.text || "(пусто)";
+      panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
 
     function renderSummary(summary) {
