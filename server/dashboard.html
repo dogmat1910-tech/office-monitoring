@@ -138,6 +138,25 @@
     .day-tile.meeting { border-left-color: #fbbf24; }
     .day-tile .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
     .day-tile .value { font-size: 20px; font-weight: 700; margin-top: 2px; }
+    .voice-seg {
+      display: grid; grid-template-columns: 70px 70px 1fr; gap: 10px;
+      padding: 8px 10px; border-bottom: 1px solid var(--border);
+      font-size: 13px; align-items: start;
+    }
+    .voice-seg:hover { background: rgba(56, 189, 248, 0.05); }
+    .voice-seg .ts { color: var(--muted); font-variant-numeric: tabular-nums; }
+    .voice-seg .dur { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+    .voice-seg .text { line-height: 1.4; }
+    .voice-seg .text.pending { color: var(--muted); font-style: italic; }
+    .voice-seg .kind {
+      display: inline-block; padding: 1px 6px; border-radius: 8px;
+      font-size: 10px; font-weight: 600; margin-right: 6px;
+      background: #1e293b; color: var(--muted);
+    }
+    .voice-seg .kind.meeting { background: #fbbf24; color: #1c1917; }
+    .voice-seg .kind.phone_work { background: #4ade80; color: #052e16; }
+    .voice-seg .kind.phone_personal { background: #f87171; color: #450a0a; }
+    .voice-seg .kind.other_speech { background: #94a3b8; color: #0f172a; }
     .token-input {
       width: 100%; box-sizing: border-box; background: #0b1220; color: var(--text);
       border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
@@ -173,6 +192,10 @@
       <div class="panel">
         <h2 style="margin-top: 0;">Сводка дня</h2>
         <div id="daySummary"></div>
+      </div>
+      <div class="panel">
+        <h2 style="margin-top: 0;">Голосовая активность (always-on)</h2>
+        <div id="voice"></div>
       </div>
       <div class="panel">
         <h2 style="margin-top: 0;">Встречи</h2>
@@ -264,18 +287,55 @@
     async function loadAgentData() {
       if (!selectedAgent) return;
       const hours = $("#hours").value;
-      const [daySummaryR, windowsR, meetingsR] = await Promise.all([
+      const [daySummaryR, windowsR, meetingsR, voiceR] = await Promise.all([
         fetch(`/agents/${selectedAgent}/day_summary?hours=${hours}`),
         fetch(`/agents/${selectedAgent}/windows?limit=50`),
         fetch(`/meetings?agent_id=${selectedAgent}&limit=20`),
+        fetch(`/agents/${selectedAgent}/voice_segments?hours=${hours}&limit=100`),
       ]);
       const daySummary = await daySummaryR.json();
       const windows = await windowsR.json();
       const meetings = await meetingsR.json();
+      const voice = await voiceR.json();
       renderDaySummary(daySummary);
       renderWindows(windows);
       renderMeetings(meetings);
+      renderVoice(voice);
       $("#updated").textContent = "обновлено " + fmtTime(new Date().toISOString());
+    }
+
+    function renderVoice(segs) {
+      const el = $("#voice");
+      if (!segs.length) {
+        el.innerHTML = '<div class="empty">голосовых сегментов нет (always-on не запущен или менеджер молчит)</div>';
+        return;
+      }
+      const total = segs.reduce((s, v) => s + v.duration_seconds, 0);
+      const transcribed = segs.filter(s => s.transcribed).length;
+      const head = `<div class="muted" style="margin-bottom: 8px; font-size: 12px;">
+        ${segs.length} сегмент(ов) · суммарно ${fmtSec(Math.round(total))} · транскрибировано ${transcribed}/${segs.length}
+      </div>`;
+      const rows = segs.map(s => {
+        const kindHtml = s.kind ? `<span class="kind ${s.kind}">${kindLabel(s.kind)}</span>` : '';
+        const text = s.transcribed
+          ? `<div class="text">${kindHtml}${escapeHTML(s.text || "(пусто)")}</div>`
+          : `<div class="text pending">${kindHtml}⏳ ждёт транскрипции...</div>`;
+        return `<div class="voice-seg">
+          <div class="ts">${fmtTime(s.started_at)}</div>
+          <div class="dur">${fmtSec(Math.round(s.duration_seconds))}</div>
+          ${text}
+        </div>`;
+      }).join("");
+      el.innerHTML = head + rows;
+    }
+
+    function kindLabel(k) {
+      return ({
+        meeting: "встреча",
+        phone_work: "тел.раб.",
+        phone_personal: "тел.личн.",
+        other_speech: "разговор",
+      })[k] || k;
     }
 
     function getToken() {
