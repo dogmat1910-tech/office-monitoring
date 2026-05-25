@@ -160,7 +160,10 @@ def main() -> None:
     last_flush = time.monotonic()
     debug_sample = os.environ.get("OM_DEBUG_SAMPLE", "0") == "1"
 
-    with httpx.Client() as client:
+    # trust_env=False — игнорируем HTTP_PROXY/HTTPS_PROXY/ALL_PROXY (включая SOCKS).
+    # Корпоративные ноутбуки иногда сидят за SOCKS-VPN (Outline/Shadowsocks), который
+    # ломает httpx без отдельной либы. Наш агент ходит на свой сервер напрямую.
+    with httpx.Client(trust_env=False) as client:
         while True:
             window = get_active_window()
             if window is not None:
