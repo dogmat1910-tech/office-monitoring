@@ -96,6 +96,28 @@
     .btn-sim:hover { background: #d97706; }
     .btn-sim.stop { background: #b91c1c; }
     .btn-sim.stop:hover { background: #dc2626; }
+    .score {
+      display: inline-block; padding: 2px 12px; border-radius: 14px;
+      font-weight: 700; font-size: 18px; margin-left: 10px;
+    }
+    .score.low { background: #7f1d1d; color: #fecaca; }
+    .score.mid { background: #92400e; color: #fde68a; }
+    .score.high { background: #14532d; color: #bbf7d0; }
+    .checklist-section { margin: 10px 0; }
+    .checklist-section h3 { font-size: 13px; font-weight: 600; margin: 8px 0; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .check-item { display: grid; grid-template-columns: 24px 1fr; gap: 8px; padding: 4px 0; align-items: start; }
+    .check-status { font-size: 14px; line-height: 20px; text-align: center; }
+    .check-status.yes { color: #4ade80; }
+    .check-status.no { color: #f87171; }
+    .check-status.na { color: #94a3b8; }
+    .check-text { font-size: 13px; line-height: 1.4; }
+    .check-comment { font-size: 12px; color: var(--muted); font-style: italic; margin-top: 2px; }
+    .err-box { background: #7f1d1d; border-radius: 6px; padding: 8px 10px; margin: 4px 0; font-size: 13px; }
+    .err-box .quote { color: #fecaca; font-style: italic; margin-top: 4px; font-size: 12px; }
+    .summary-box { background: #1e3a5f; border-radius: 6px; padding: 10px 12px; margin: 10px 0; line-height: 1.5; }
+    .twocol { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 10px; }
+    .twocol h4 { font-size: 13px; margin: 0 0 6px; color: var(--muted); font-weight: 600; }
+    .twocol ul { margin: 0; padding-left: 20px; line-height: 1.5; font-size: 13px; }
     .token-input {
       width: 100%; box-sizing: border-box; background: #0b1220; color: var(--text);
       border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
@@ -135,6 +157,11 @@
       <div class="panel">
         <h2 style="margin-top: 0;">Встречи</h2>
         <div id="meetings"></div>
+      </div>
+      <div class="panel" id="analysisPanel" style="display:none">
+        <h2 style="margin-top: 0;">Анализ встречи <span id="analysisMeetingId" class="muted"></span> <span id="analysisScore"></span></h2>
+        <div id="analysisMeta" class="muted" style="font-size: 12px; margin-bottom: 10px;"></div>
+        <div id="analysisContent"></div>
       </div>
       <div class="panel" id="transcriptPanel" style="display:none">
         <h2 style="margin-top: 0;">Транскрипт встречи <span id="transcriptMeetingId" class="muted"></span></h2>
@@ -279,10 +306,91 @@
             <td class="num">${m.duration_seconds != null ? fmtSec(m.duration_seconds) : '—'}</td>
             <td>${escapeHTML(m.client_name || '—')}</td>
             <td class="muted">${m.meeting_id}</td>
-            <td>${m.ended_at ? `<button class="btn-sim" data-tx="${m.meeting_id}">транскрипт</button>` : ''}</td>
+            <td>${m.ended_at ? `
+              <button class="btn-sim" data-an="${m.meeting_id}">анализ</button>
+              <button class="btn-sim" data-tx="${m.meeting_id}">транскрипт</button>` : ''}</td>
           </tr>`).join("")}</tbody>
       </table>`;
       el.querySelectorAll("[data-tx]").forEach(b => b.addEventListener("click", () => loadTranscript(b.dataset.tx)));
+      el.querySelectorAll("[data-an]").forEach(b => b.addEventListener("click", () => loadAnalysis(b.dataset.an)));
+    }
+
+    function scoreClass(s) {
+      if (s == null) return "low";
+      if (s <= 4) return "low";
+      if (s <= 7) return "mid";
+      return "high";
+    }
+    function statusIcon(s) {
+      if (s === "yes") return "✓";
+      if (s === "no") return "✗";
+      return "—";
+    }
+
+    async function loadAnalysis(meetingId) {
+      const r = await fetch(`/meetings/${meetingId}/analysis`);
+      const d = await r.json();
+      const panel = $("#analysisPanel");
+      panel.style.display = "block";
+      $("#analysisMeetingId").textContent = "#" + meetingId;
+
+      if (d.status === "pending") {
+        $("#analysisScore").innerHTML = "";
+        $("#analysisMeta").textContent = "LLM-анализ в очереди — обнови через 20-40 сек";
+        $("#analysisContent").innerHTML = '<div class="empty">⏳ воркер работает...</div>';
+        return;
+      }
+
+      const score = d.final_score;
+      $("#analysisScore").innerHTML = score != null ? `<span class="score ${scoreClass(score)}">${score}/10</span>` : "";
+      $("#analysisMeta").textContent = `модель: ${d.model} · обработано за ${(d.processing_time_seconds || 0).toFixed(1)} с`;
+
+      const checklist = d.checklist || {};
+      const sections = {};
+      Object.entries(checklist).forEach(([id, item]) => {
+        const sectionId = id.split(".")[0];
+        if (!sections[sectionId]) sections[sectionId] = [];
+        sections[sectionId].push({ id, ...item });
+      });
+
+      const sectionNames = { "1": "Приветствие", "2": "Выявление потребности", "3": "Презентация", "4": "Отработка возражений", "5": "Закрытие сделки" };
+
+      let html = "";
+
+      if (d.summary) {
+        html += `<div class="summary-box">${escapeHTML(d.summary)}</div>`;
+      }
+
+      if (d.critical_errors && d.critical_errors.length) {
+        html += `<h3 class="checklist-section">🚨 Грубые ошибки</h3>`;
+        d.critical_errors.forEach(e => {
+          html += `<div class="err-box"><strong>${escapeHTML(e.type || "ошибка")}</strong>${e.quote ? `<div class="quote">«${escapeHTML(e.quote)}»</div>` : ""}</div>`;
+        });
+      }
+
+      html += '<div class="checklist-section">';
+      Object.entries(sections).forEach(([sid, items]) => {
+        html += `<h3>${sid}. ${sectionNames[sid] || ""}</h3>`;
+        items.forEach(it => {
+          html += `<div class="check-item">
+            <div class="check-status ${it.status === "yes" ? "yes" : it.status === "no" ? "no" : "na"}">${statusIcon(it.status)}</div>
+            <div>
+              <div class="check-text">${escapeHTML(it.id)} ${escapeHTML(it.comment || "")}</div>
+            </div>
+          </div>`;
+        });
+      });
+      html += "</div>";
+
+      if ((d.strengths && d.strengths.length) || (d.growth_areas && d.growth_areas.length)) {
+        html += `<div class="twocol">
+          <div><h4>Сильные стороны</h4><ul>${(d.strengths || []).map(s => `<li>${escapeHTML(s)}</li>`).join("")}</ul></div>
+          <div><h4>Зоны роста</h4><ul>${(d.growth_areas || []).map(s => `<li>${escapeHTML(s)}</li>`).join("")}</ul></div>
+        </div>`;
+      }
+
+      $("#analysisContent").innerHTML = html;
+      panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
 
     async function loadTranscript(meetingId) {

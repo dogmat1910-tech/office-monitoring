@@ -19,7 +19,8 @@ from pathlib import Path
 from sqlmodel import Session, select
 
 # импорт моделей и engine из main.py
-from main import AUDIO_DIR, AudioChunk, Meeting, Transcript, engine
+from main import AUDIO_DIR, Analysis, AudioChunk, Meeting, Transcript, engine
+from analyze import analyze_transcript
 from transcribe import get_model, transcribe_meeting
 
 logging.basicConfig(
@@ -32,10 +33,9 @@ log = logging.getLogger("worker")
 POLL_INTERVAL = int(os.environ.get("OM_WORKER_POLL_INTERVAL", "10"))
 
 
-def find_pending_meeting() -> int | None:
-    """Возвращает meeting_id первой закрытой встречи без транскрипта."""
+def find_pending_transcription() -> int | None:
+    """Закрытая встреча без транскрипта."""
     with Session(engine) as session:
-        # подзапрос: meeting_id у которых есть Transcript
         subq = select(Transcript.meeting_id)
         meeting = session.exec(
             select(Meeting)
@@ -44,6 +44,19 @@ def find_pending_meeting() -> int | None:
             .order_by(Meeting.ended_at)
         ).first()
         return meeting.id if meeting else None
+
+
+def find_pending_analysis() -> int | None:
+    """Транскрибированная встреча без LLM-анализа (и с непустым текстом)."""
+    with Session(engine) as session:
+        subq = select(Analysis.meeting_id)
+        transcript = session.exec(
+            select(Transcript)
+            .where(~Transcript.meeting_id.in_(subq))
+            .where(Transcript.text != "")
+            .order_by(Transcript.transcribed_at)
+        ).first()
+        return transcript.meeting_id if transcript else None
 
 
 def get_chunk_paths(meeting_id: int) -> list[Path]:
@@ -71,32 +84,81 @@ def save_transcript(meeting_id: int, result: dict) -> None:
         session.commit()
 
 
+def save_analysis(meeting_id: int, payload: dict) -> None:
+    import json as _json
+    meta = payload.pop("_meta", {})
+    with Session(engine) as session:
+        a = Analysis(
+            meeting_id=meeting_id,
+            payload_json=_json.dumps(payload, ensure_ascii=False),
+            final_score=payload.get("final_score"),
+            model=meta.get("model", os.environ.get("OM_LLM_MODEL", "?")),
+            analyzed_at=datetime.now(timezone.utc),
+            processing_time_seconds=meta.get("processing_time_seconds"),
+        )
+        session.add(a)
+        session.commit()
+
+
+def get_transcript_text(meeting_id: int) -> str | None:
+    with Session(engine) as session:
+        t = session.exec(select(Transcript).where(Transcript.meeting_id == meeting_id)).first()
+        return t.text if t else None
+
+
 def process_one() -> bool:
-    """Обрабатывает одну встречу. Возвращает True если что-то сделали."""
-    meeting_id = find_pending_meeting()
-    if meeting_id is None:
-        return False
-    paths = get_chunk_paths(meeting_id)
-    if not paths:
-        log.warning("meeting %d закрыта, но нет audio chunks — записываем пустой транскрипт", meeting_id)
-        save_transcript(meeting_id, {"text": "", "language": None, "duration_seconds": 0.0, "processing_time_seconds": 0.0})
-        return True
-    try:
-        log.info("meeting %d: старт транскрипции", meeting_id)
-        result = transcribe_meeting(meeting_id, paths)
-        save_transcript(meeting_id, result)
-        log.info("meeting %d: транскрипт сохранён", meeting_id)
-        return True
-    except Exception as e:
-        log.exception("meeting %d: ошибка транскрипции: %s", meeting_id, e)
-        # чтобы не зацикливаться на сломанной встрече — сохраняем пустой транскрипт с пометкой
-        save_transcript(meeting_id, {
-            "text": f"[ошибка транскрипции: {e}]",
-            "language": None,
-            "duration_seconds": 0.0,
-            "processing_time_seconds": 0.0,
-        })
-        return True
+    """Обрабатывает одну задачу. Транскрипция приоритетнее анализа."""
+    # Этап 1: транскрипция
+    meeting_id = find_pending_transcription()
+    if meeting_id is not None:
+        paths = get_chunk_paths(meeting_id)
+        if not paths:
+            log.warning("meeting %d закрыта, но нет audio chunks — пустой транскрипт", meeting_id)
+            save_transcript(meeting_id, {"text": "", "language": None, "duration_seconds": 0.0, "processing_time_seconds": 0.0})
+            return True
+        try:
+            log.info("meeting %d: старт транскрипции", meeting_id)
+            result = transcribe_meeting(meeting_id, paths)
+            save_transcript(meeting_id, result)
+            log.info("meeting %d: транскрипт сохранён", meeting_id)
+            return True
+        except Exception as e:
+            log.exception("meeting %d: ошибка транскрипции: %s", meeting_id, e)
+            save_transcript(meeting_id, {
+                "text": f"[ошибка транскрипции: {e}]",
+                "language": None,
+                "duration_seconds": 0.0,
+                "processing_time_seconds": 0.0,
+            })
+            return True
+
+    # Этап 2: LLM-анализ
+    meeting_id = find_pending_analysis()
+    if meeting_id is not None:
+        text = get_transcript_text(meeting_id)
+        if not text:
+            return False
+        try:
+            log.info("meeting %d: старт LLM-анализа", meeting_id)
+            payload = analyze_transcript(text)
+            save_analysis(meeting_id, payload)
+            log.info("meeting %d: анализ сохранён (score=%s)", meeting_id, payload.get("final_score"))
+            return True
+        except Exception as e:
+            log.exception("meeting %d: ошибка LLM-анализа: %s", meeting_id, e)
+            # отмечаем что пробовали — иначе зациклимся
+            save_analysis(meeting_id, {
+                "summary": f"[ошибка анализа: {e}]",
+                "final_score": None,
+                "checklist": {},
+                "critical_errors": [],
+                "strengths": [],
+                "growth_areas": [],
+                "_meta": {"model": "error", "processing_time_seconds": 0.0},
+            })
+            return True
+
+    return False
 
 
 def main() -> None:

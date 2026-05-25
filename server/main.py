@@ -76,6 +76,16 @@ class Transcript(SQLModel, table=True):
     processing_time_seconds: float | None = None
 
 
+class Analysis(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    meeting_id: int = Field(index=True, unique=True)
+    payload_json: str  # сериализованный JSON от LLM (checklist, errors, summary, ...)
+    final_score: int | None = None
+    model: str
+    analyzed_at: datetime
+    processing_time_seconds: float | None = None
+
+
 class HeartbeatIn(BaseModel):
     agent_id: str
     hostname: str
@@ -373,6 +383,24 @@ async def upload_audio_chunk(
             ))
         session.commit()
     return {"status": "ok", "meeting_id": meeting_id, "chunk_index": chunk_index, "size_bytes": len(contents)}
+
+
+@app.get("/meetings/{meeting_id}/analysis")
+def get_meeting_analysis(meeting_id: int) -> dict:
+    import json as _json
+    with Session(engine) as session:
+        a = session.exec(select(Analysis).where(Analysis.meeting_id == meeting_id)).first()
+        if a is None:
+            return {"meeting_id": meeting_id, "status": "pending"}
+        return {
+            "meeting_id": meeting_id,
+            "status": "done",
+            "final_score": a.final_score,
+            "model": a.model,
+            "analyzed_at": _as_utc(a.analyzed_at).isoformat(),
+            "processing_time_seconds": a.processing_time_seconds,
+            **_json.loads(a.payload_json),
+        }
 
 
 @app.get("/meetings/{meeting_id}/transcript")
