@@ -23,11 +23,12 @@ import httpx
 from sqlmodel import Session, select
 
 from main import (
-    AppCategory, DailyReport, DomainCategory, Meeting, Analysis,
-    Transcript, VoiceSegment, WindowSample, engine,
+    AppCategory, DailyReport, DomainCategory, IdleSample, KeystrokeSample,
+    Meeting, Analysis, Transcript, VoiceSegment, WindowSample, engine,
     DEFAULT_CATEGORIES, DEFAULT_DOMAIN_CATEGORIES, BROWSER_APPS,
     extract_url_from_title, extract_domain, _as_utc,
 )
+from sqlalchemy import func
 
 log = logging.getLogger("worker")
 
@@ -129,6 +130,32 @@ def collect_day_data(agent_id: str, report_date: str) -> dict:
                 "transcript_excerpt": (transcript.text[:500] + "...") if transcript and transcript.text and len(transcript.text) > 500 else (transcript.text if transcript else None),
             })
 
+        # Idle: сколько времени менеджер был «не за компом» (idle > 60 сек)
+        idle_rows = session.exec(
+            select(IdleSample)
+            .where(IdleSample.agent_id == agent_id)
+            .where(IdleSample.captured_at >= start)
+            .where(IdleSample.captured_at < end)
+        ).all()
+        idle_threshold = 60
+        total_idle_interval = sum(r.interval_seconds for r in idle_rows)
+        idle_seconds = sum(r.interval_seconds for r in idle_rows if r.idle_seconds > idle_threshold)
+        active_at_pc_seconds = total_idle_interval - idle_seconds
+
+        # Keystrokes: сколько и где набирал
+        ks_rows = session.exec(
+            select(KeystrokeSample.app_name, func.sum(KeystrokeSample.keystroke_count))
+            .where(KeystrokeSample.agent_id == agent_id)
+            .where(KeystrokeSample.captured_at >= start)
+            .where(KeystrokeSample.captured_at < end)
+            .group_by(KeystrokeSample.app_name)
+        ).all()
+        keystrokes_by_app = sorted(
+            [{"app_name": app or "unknown", "count": int(n or 0)} for app, n in ks_rows],
+            key=lambda x: -x["count"],
+        )
+        keystrokes_total = sum(x["count"] for x in keystrokes_by_app)
+
         # Голосовые сегменты — делим на «во время встречи» и «вне встречи»
         voice = session.exec(
             select(VoiceSegment)
@@ -163,8 +190,12 @@ def collect_day_data(agent_id: str, report_date: str) -> dict:
             "top_entities": top_entities,
             "meetings": meeting_list,
             "voice_outside_meetings_seconds": outside_meeting_seconds,
-            "voice_outside_meetings_segments": outside_meeting_segments[:50],  # ограничиваем для промпта
+            "voice_outside_meetings_segments": outside_meeting_segments[:50],
             "voice_inside_meetings_seconds": in_meeting_seconds,
+            "active_at_pc_seconds": active_at_pc_seconds,
+            "idle_seconds": idle_seconds,
+            "keystrokes_total": keystrokes_total,
+            "keystrokes_by_app": keystrokes_by_app[:15],
         }
 
 
@@ -206,6 +237,11 @@ def build_user_prompt(data: dict) -> str:
         for v in data["voice_outside_meetings_segments"][:30]
     ) or "  (вне встреч голос не зафиксирован)"
 
+    keystrokes_text = "\n".join(
+        f"  • {k['app_name']}: {k['count']} знаков"
+        for k in data.get("keystrokes_by_app", [])[:10]
+    ) or "  (нет данных по клавиатуре)"
+
     by_cat = data["by_category"]
 
     return f"""\
@@ -217,6 +253,15 @@ def build_user_prompt(data: dict) -> str:
   нейтр.: {_fmt_secs(by_cat['neutral'])}
   ────────────
   всего трекинга: {_fmt_secs(data['tracking_total_seconds'])}
+
+ПРИСУТСТВИЕ ЗА КОМПЬЮТЕРОМ:
+  активно за компом: {_fmt_secs(data.get('active_at_pc_seconds', 0))}
+  бездействие (idle > 60 сек, отошёл): {_fmt_secs(data.get('idle_seconds', 0))}
+
+КЛАВИАТУРНАЯ АКТИВНОСТЬ:
+  всего нажатий: {data.get('keystrokes_total', 0)} знаков
+  по приложениям (топ-10):
+{keystrokes_text}
 
 ТОП приложений и сайтов:
 {apps_text}
@@ -252,6 +297,8 @@ def build_user_prompt(data: dict) -> str:
   "procrastination": {{
     "personal_seconds": <число>,
     "top_distractions": [{{"name": "<сайт/прилож>", "seconds": <число>}}, ...],
+    "idle_seconds": <число секунд бездействия — отходил от компа>,
+    "keystroke_distribution": "<2-3 предложения: где менеджер набирал текст. Например: 'Из 4200 знаков 2800 в AmoCRM (работа) и 1200 в Telegram (личное) — половина клавиатурной активности на личное'>",
     "observations": ["<наблюдение>", ...]
   }},
   "productivity_score": <число 0-10>,
@@ -265,6 +312,11 @@ productivity_score:
 - 4-6: средне — работал, но с большими отвлечениями или слабые продажи
 - 7-8: хорошо — работа+продажи в норме, прокрастинация в пределах
 - 9-10: эталон — высокая активность, качественные встречи, минимум личного
+
+ВАЖНО при оценке прокрастинации учитывай:
+- idle_seconds большой (>2 ч в день) = менеджер часто отходит от компа
+- много keystrokes в личных приложениях (Telegram, ВКонтакте) = личная переписка
+- мало keystrokes в work-приложениях + мало встреч = бездействие за компом
 """
 
 

@@ -1019,7 +1019,9 @@
         <div class="daily-section proc">
           <h3>🚫 Прокрастинация</h3>
           <div class="big-num">${fmtSec(pr.personal_seconds || 0)}</div>
+          ${pr.idle_seconds ? `<div class="daily-meta">бездействие (отошёл от компа): ${fmtSec(pr.idle_seconds)}</div>` : ""}
           ${(pr.top_distractions || []).length ? `<ul>${pr.top_distractions.map(x => `<li>${escapeHTML(x.name)}: ${fmtSec(x.seconds || 0)}</li>`).join("")}</ul>` : '<div class="daily-meta">личного не зафиксировано</div>'}
+          ${pr.keystroke_distribution ? `<div class="daily-meta" style="margin-top:8px;"><strong>⌨ Клавиатура:</strong> ${escapeHTML(pr.keystroke_distribution)}</div>` : ""}
           ${(pr.observations || []).length ? `<div class="daily-meta" style="margin-top:8px;"><strong>Наблюдения:</strong></div><ul>${pr.observations.map(x => `<li>${escapeHTML(x)}</li>`).join("")}</ul>` : ""}
         </div>`;
 
