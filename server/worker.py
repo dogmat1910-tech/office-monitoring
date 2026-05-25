@@ -21,6 +21,7 @@ from sqlmodel import Session, select
 # импорт моделей и engine из main.py
 from main import AUDIO_DIR, VOICE_DIR, Analysis, AudioChunk, DailyReport, Meeting, Transcript, VoiceSegment, engine
 from analyze import analyze_transcript
+from analyze_conversation import analyze_conversation
 from classify_voice import auto_bind_meeting_id, classify_voice_segment
 from conversations import cluster_pending_segments, get_active_agents_with_pending_segments
 from daily_report import generate_daily_report
@@ -71,6 +72,56 @@ def find_pending_voice_segment() -> int | None:
             .order_by(VoiceSegment.started_at)
         ).first()
         return seg.id if seg else None
+
+
+def find_pending_conversation_analysis() -> int | None:
+    """Conversation без LLM-анализа (kind IS NULL)."""
+    from main import Conversation
+    with Session(engine) as session:
+        c = session.exec(
+            select(Conversation)
+            .where(Conversation.kind.is_(None))
+            .where(Conversation.full_text.is_not(None))
+            .where(Conversation.full_text != "")
+            .order_by(Conversation.started_at)
+        ).first()
+        return c.id if c else None
+
+
+def process_conversation_analysis(conv_id: int) -> None:
+    from main import Conversation
+    import json as _json
+    try:
+        result = analyze_conversation(conv_id)
+        meta = result.pop("_meta", {})
+        with Session(engine) as session:
+            c = session.exec(select(Conversation).where(Conversation.id == conv_id)).first()
+            if c is None:
+                return
+            c.kind = result.get("kind")
+            c.confidence = result.get("confidence")
+            c.summary = result.get("summary")
+            c.is_with_client = result.get("is_with_client")
+            c.is_sale_attempt = result.get("is_sale_attempt")
+            c.is_sale_closed = result.get("is_sale_closed")
+            c.sale_quality_score = result.get("sale_quality_score")
+            c.payload_json = _json.dumps(result, ensure_ascii=False)
+            c.analyzed_at = datetime.now(timezone.utc)
+            # пересчёт sync_status: если LLM решил что это meeting, но кнопки не было
+            if c.kind == "meeting" and not c.related_meeting_id:
+                c.sync_status = "missed_button"
+            session.add(c)
+            session.commit()
+    except Exception as e:
+        log.exception("conversation %d: ошибка LLM-анализа: %s", conv_id, e)
+        with Session(engine) as session:
+            c = session.exec(select(Conversation).where(Conversation.id == conv_id)).first()
+            if c:
+                c.kind = "other_speech"
+                c.summary = f"[ошибка анализа: {e}]"[:200]
+                c.analyzed_at = datetime.now(timezone.utc)
+                session.add(c)
+                session.commit()
 
 
 def find_pending_voice_classification() -> int | None:
@@ -294,6 +345,12 @@ def process_one() -> bool:
         n = cluster_pending_segments(agent_id)
         if n:
             return True  # делаем по одному агенту за итерацию
+
+    # Этап 2.8: LLM-анализ conversation целиком
+    conv_id = find_pending_conversation_analysis()
+    if conv_id is not None:
+        process_conversation_analysis(conv_id)
+        return True
 
     # Этап 3: pending daily reports
     pending_report = find_pending_daily_report()
