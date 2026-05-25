@@ -65,6 +65,17 @@ class AudioChunk(SQLModel, table=True):
     size_bytes: int
 
 
+class Transcript(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    meeting_id: int = Field(index=True, unique=True)
+    text: str
+    language: str | None = None
+    model: str
+    duration_seconds: float | None = None
+    transcribed_at: datetime
+    processing_time_seconds: float | None = None
+
+
 class HeartbeatIn(BaseModel):
     agent_id: str
     hostname: str
@@ -362,6 +373,24 @@ async def upload_audio_chunk(
             ))
         session.commit()
     return {"status": "ok", "meeting_id": meeting_id, "chunk_index": chunk_index, "size_bytes": len(contents)}
+
+
+@app.get("/meetings/{meeting_id}/transcript")
+def get_meeting_transcript(meeting_id: int) -> dict:
+    with Session(engine) as session:
+        t = session.exec(select(Transcript).where(Transcript.meeting_id == meeting_id)).first()
+        if t is None:
+            return {"meeting_id": meeting_id, "status": "pending"}
+        return {
+            "meeting_id": meeting_id,
+            "status": "done",
+            "text": t.text,
+            "language": t.language,
+            "model": t.model,
+            "duration_seconds": t.duration_seconds,
+            "transcribed_at": _as_utc(t.transcribed_at).isoformat(),
+            "processing_time_seconds": t.processing_time_seconds,
+        }
 
 
 @app.get("/meetings/{meeting_id}/audio")
