@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>office-monitoring · дашборд</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --border: #334155;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --online: #4ade80;
+      --offline: #f87171;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+    }
+    header {
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    .muted { color: var(--muted); }
+    main {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      min-height: calc(100vh - 50px);
+    }
+    aside {
+      border-right: 1px solid var(--border);
+      padding: 16px;
+      overflow-y: auto;
+    }
+    section { padding: 16px 20px; overflow-y: auto; }
+    .agent {
+      padding: 10px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-bottom: 6px;
+      border: 1px solid transparent;
+    }
+    .agent:hover { background: var(--panel); }
+    .agent.selected { border-color: var(--accent); background: var(--panel); }
+    .agent .name { font-weight: 600; }
+    .agent .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+    .dot.online { background: var(--online); }
+    .dot.offline { background: var(--offline); }
+    h2 { font-size: 15px; margin: 18px 0 10px; font-weight: 600; }
+    .panel { background: var(--panel); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .bar-row { display: grid; grid-template-columns: 200px 1fr 80px; gap: 10px; align-items: center; padding: 4px 0; }
+    .bar-row .name { font-weight: 500; }
+    .bar-row .bar-bg { background: #0b1220; border-radius: 4px; height: 10px; overflow: hidden; }
+    .bar-row .bar-fill { background: var(--accent); height: 100%; }
+    .bar-row .num { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .controls { display: flex; gap: 10px; align-items: center; }
+    .controls select, .controls button {
+      background: var(--panel); color: var(--text); border: 1px solid var(--border);
+      border-radius: 6px; padding: 6px 10px; font-size: 13px;
+    }
+    .controls button { cursor: pointer; }
+    .controls button:hover { border-color: var(--accent); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .empty { color: var(--muted); padding: 12px; text-align: center; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>office-monitoring</h1>
+    <div class="controls">
+      <label class="muted">период:
+        <select id="hours">
+          <option value="1">1 час</option>
+          <option value="8" selected>8 часов</option>
+          <option value="24">24 часа</option>
+          <option value="168">7 дней</option>
+        </select>
+      </label>
+      <button id="refresh">обновить</button>
+      <span id="updated" class="muted"></span>
+    </div>
+  </header>
+  <main>
+    <aside>
+      <h2>Агенты</h2>
+      <div id="agents"></div>
+    </aside>
+    <section>
+      <div class="panel">
+        <h2 style="margin-top: 0;">Сводка по приложениям</h2>
+        <div id="summary"></div>
+      </div>
+      <div class="panel">
+        <h2 style="margin-top: 0;">Последние окна</h2>
+        <div id="windows"></div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const $ = (s) => document.querySelector(s);
+    const fmtSec = (s) => {
+      if (s < 60) return s + " с";
+      const m = Math.floor(s / 60), sec = s % 60;
+      if (m < 60) return m + " мин " + sec + " с";
+      const h = Math.floor(m / 60), mm = m % 60;
+      return h + " ч " + mm + " мин";
+    };
+    const fmtTime = (iso) => {
+      const d = new Date(iso);
+      return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    };
+
+    let selectedAgent = null;
+
+    async function loadAgents() {
+      const r = await fetch("/agents");
+      const agents = await r.json();
+      const el = $("#agents");
+      if (!agents.length) {
+        el.innerHTML = '<div class="empty">нет агентов</div>';
+        return;
+      }
+      el.innerHTML = agents.map(a => `
+        <div class="agent ${a.agent_id === selectedAgent ? 'selected' : ''}" data-id="${a.agent_id}">
+          <div class="name"><span class="dot ${a.online ? 'online' : 'offline'}"></span>${escapeHTML(a.hostname)}</div>
+          <div class="meta">${escapeHTML(a.username)} · ${a.online ? 'online' : 'offline'}</div>
+        </div>
+      `).join("");
+      el.querySelectorAll(".agent").forEach(node => {
+        node.addEventListener("click", () => {
+          selectedAgent = node.dataset.id;
+          loadAgents();
+          loadAgentData();
+        });
+      });
+      if (!selectedAgent && agents.length) {
+        selectedAgent = agents[0].agent_id;
+        loadAgents();
+        loadAgentData();
+      }
+    }
+
+    async function loadAgentData() {
+      if (!selectedAgent) return;
+      const hours = $("#hours").value;
+      const [summaryR, windowsR] = await Promise.all([
+        fetch(`/agents/${selectedAgent}/summary?hours=${hours}`),
+        fetch(`/agents/${selectedAgent}/windows?limit=50`),
+      ]);
+      const summary = await summaryR.json();
+      const windows = await windowsR.json();
+      renderSummary(summary);
+      renderWindows(windows);
+      $("#updated").textContent = "обновлено " + fmtTime(new Date().toISOString());
+    }
+
+    function renderSummary(summary) {
+      const el = $("#summary");
+      if (!summary.by_app.length) {
+        el.innerHTML = '<div class="empty">пусто за этот период</div>';
+        return;
+      }
+      const max = summary.by_app[0].seconds;
+      el.innerHTML = `
+        <div class="muted" style="margin-bottom: 10px;">всего: ${fmtSec(summary.total_seconds)} · период: ${summary.hours} ч</div>
+        ${summary.by_app.map(item => {
+          const pct = max > 0 ? (item.seconds / max * 100).toFixed(1) : 0;
+          return `<div class="bar-row">
+            <div class="name">${escapeHTML(item.app_name)}</div>
+            <div class="bar-bg"><div class="bar-fill" style="width:${pct}%"></div></div>
+            <div class="num">${fmtSec(item.seconds)}</div>
+          </div>`;
+        }).join("")}
+      `;
+    }
+
+    function renderWindows(windows) {
+      const el = $("#windows");
+      if (!windows.length) {
+        el.innerHTML = '<div class="empty">нет данных</div>';
+        return;
+      }
+      el.innerHTML = `<table>
+        <thead><tr><th>Время</th><th>Приложение</th><th>Заголовок окна</th><th class="num">Длительность</th></tr></thead>
+        <tbody>${windows.map(w => `
+          <tr>
+            <td class="muted">${fmtTime(w.captured_at)}</td>
+            <td>${escapeHTML(w.app_name)}</td>
+            <td class="muted">${escapeHTML(w.title || "—")}</td>
+            <td class="num">${fmtSec(w.duration_seconds)}</td>
+          </tr>
+        `).join("")}</tbody>
+      </table>`;
+    }
+
+    function escapeHTML(s) {
+      return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+    }
+
+    $("#refresh").addEventListener("click", () => { loadAgents(); loadAgentData(); });
+    $("#hours").addEventListener("change", loadAgentData);
+
+    loadAgents();
+    setInterval(() => { loadAgents(); loadAgentData(); }, 30000);
+  </script>
+</body>
+</html>

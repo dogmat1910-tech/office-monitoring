@@ -2,11 +2,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
-DB_PATH = Path(__file__).parent / "office_monitoring.db"
+BASE_DIR = Path(__file__).parent
+DB_PATH = BASE_DIR / "office_monitoring.db"
+DASHBOARD_HTML = BASE_DIR / "dashboard.html"
 engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, connect_args={"check_same_thread": False})
 
 
@@ -64,6 +67,11 @@ def on_startup() -> None:
 
 def _as_utc(dt: datetime) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard() -> HTMLResponse:
+    return HTMLResponse(DASHBOARD_HTML.read_text(encoding="utf-8"))
 
 
 @app.get("/health")
