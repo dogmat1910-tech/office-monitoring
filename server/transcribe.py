@@ -68,6 +68,29 @@ def _concat_wav_chunks(chunk_paths: list[Path]) -> tuple[bytes, float]:
     return buf.getvalue(), duration
 
 
+# Типичные галлюцинации Whisper на тихих/шумных сегментах. Если транскрипт
+# целиком состоит из такой фразы — выкидываем.
+_HALLUCINATION_PATTERNS = [
+    "спасибо за просмотр", "субтитры", "продолжение следует",
+    "редактор субтитров", "ставьте лайки", "подписывайтесь",
+    "до встречи", "всем пока", "thank you", "thanks for watching",
+    "субтитлы делал", "субтитры делал", "корректор", "ух, ах",
+]
+
+
+def _looks_like_hallucination(text: str) -> bool:
+    if not text:
+        return True
+    t = text.lower().strip(" .,!?-—\"'")
+    # короткое целиком в чёрном списке
+    if len(t) < 80:
+        for pat in _HALLUCINATION_PATTERNS:
+            if pat in t:
+                # если в коротком тексте есть «триггер» галлюцинации — выкидываем
+                return True
+    return False
+
+
 def _transcribe_path(path: Path, vad_filter: bool = True) -> dict:
     """Ядро транскрипции. Возвращает {text, language, processing_time_seconds}."""
     model = get_model()
@@ -77,8 +100,31 @@ def _transcribe_path(path: Path, vad_filter: bool = True) -> dict:
         language=WHISPER_LANGUAGE if WHISPER_LANGUAGE else None,
         vad_filter=vad_filter,
         vad_parameters={"min_silence_duration_ms": 500} if vad_filter else None,
+        # Фильтры против галлюцинаций:
+        # - выше no_speech_threshold = чаще считаем что это тишина (по умолчанию 0.6)
+        # - log_prob_threshold отсекает сегменты с низкой уверенностью
+        # - condition_on_previous_text=False — не цепляемся за предыдущий
+        #   контекст (это часто и приводит к "субтитры... субтитры... субтитры")
+        no_speech_threshold=0.7,
+        log_prob_threshold=-1.0,
+        condition_on_previous_text=False,
+        temperature=0.0,
     )
-    text = " ".join(s.text.strip() for s in segments).strip()
+    parts: list[str] = []
+    for s in segments:
+        seg_text = s.text.strip()
+        if not seg_text:
+            continue
+        # вторичный фильтр на уровне каждого сегмента
+        if _looks_like_hallucination(seg_text):
+            log.debug("отбросили галлюцинацию: %r", seg_text)
+            continue
+        parts.append(seg_text)
+    text = " ".join(parts).strip()
+    # Финальная проверка: если после фильтра остался один короткий обрывок,
+    # который тоже похож на галлюцинацию — выкидываем целиком
+    if _looks_like_hallucination(text):
+        text = ""
     return {
         "text": text,
         "language": info.language,

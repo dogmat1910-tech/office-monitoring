@@ -26,9 +26,9 @@ FRAME_MS = 30  # webrtcvad принимает 10/20/30ms
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000  # 480
 FRAME_BYTES = FRAME_SAMPLES * 2  # int16 = 2 bytes/sample
 
-VAD_AGGRESSIVENESS = int(os.environ.get("OM_VAD_AGGRESSIVENESS", "2"))  # 0-3
+VAD_AGGRESSIVENESS = int(os.environ.get("OM_VAD_AGGRESSIVENESS", "3"))  # 0-3
 SILENCE_TO_END_MS = int(os.environ.get("OM_SILENCE_TO_END_MS", "1500"))
-MIN_SEGMENT_MS = int(os.environ.get("OM_MIN_SEGMENT_MS", "1000"))
+MIN_SEGMENT_MS = int(os.environ.get("OM_MIN_SEGMENT_MS", "2500"))
 MAX_SEGMENT_MS = int(os.environ.get("OM_MAX_SEGMENT_MS", "60000"))
 
 PAUSE_FILE = Path(os.environ.get(
