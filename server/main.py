@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy import func
@@ -11,6 +11,8 @@ from sqlmodel import Field, Session, SQLModel, create_engine, select
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "office_monitoring.db"
 DASHBOARD_HTML = BASE_DIR / "dashboard.html"
+AUDIO_DIR = BASE_DIR / "audio_data"
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, connect_args={"check_same_thread": False})
 
 # Токен для эндпоинтов которые дёргает внешний сервис (твой самописный календарь).
@@ -52,6 +54,15 @@ class Meeting(SQLModel, table=True):
     client_name: str | None = None
     notes: str | None = None
     external_id: str | None = Field(default=None, index=True)  # id из самописного календаря
+
+
+class AudioChunk(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    meeting_id: int = Field(index=True)
+    chunk_index: int
+    file_path: str  # относительно AUDIO_DIR
+    received_at: datetime = Field(index=True)
+    size_bytes: int
 
 
 class HeartbeatIn(BaseModel):
@@ -314,6 +325,64 @@ def get_active_meeting(agent_id: str) -> dict:
             "meeting_id": meeting.id,
             "started_at": _as_utc(meeting.started_at).isoformat(),
             "client_name": meeting.client_name,
+        }
+
+
+@app.post("/meetings/{meeting_id}/audio")
+async def upload_audio_chunk(
+    meeting_id: int,
+    chunk_index: int = Form(...),
+    file: UploadFile = File(...),
+) -> dict:
+    """Агент шлёт WAV-чанки во время записи встречи."""
+    contents = await file.read()
+    audio_dir = AUDIO_DIR / str(meeting_id)
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    path = audio_dir / f"chunk_{chunk_index:04d}.wav"
+    path.write_bytes(contents)
+
+    rel_path = str(path.relative_to(AUDIO_DIR))
+    with Session(engine) as session:
+        # idempotency: один и тот же (meeting_id, chunk_index) перезаписываем
+        existing = session.exec(
+            select(AudioChunk).where(AudioChunk.meeting_id == meeting_id, AudioChunk.chunk_index == chunk_index)
+        ).first()
+        if existing:
+            existing.file_path = rel_path
+            existing.size_bytes = len(contents)
+            existing.received_at = datetime.now(timezone.utc)
+            session.add(existing)
+        else:
+            session.add(AudioChunk(
+                meeting_id=meeting_id,
+                chunk_index=chunk_index,
+                file_path=rel_path,
+                received_at=datetime.now(timezone.utc),
+                size_bytes=len(contents),
+            ))
+        session.commit()
+    return {"status": "ok", "meeting_id": meeting_id, "chunk_index": chunk_index, "size_bytes": len(contents)}
+
+
+@app.get("/meetings/{meeting_id}/audio")
+def list_meeting_audio(meeting_id: int) -> dict:
+    with Session(engine) as session:
+        chunks = session.exec(
+            select(AudioChunk).where(AudioChunk.meeting_id == meeting_id).order_by(AudioChunk.chunk_index)
+        ).all()
+        return {
+            "meeting_id": meeting_id,
+            "chunks": [
+                {
+                    "chunk_index": c.chunk_index,
+                    "file_path": c.file_path,
+                    "received_at": _as_utc(c.received_at).isoformat(),
+                    "size_bytes": c.size_bytes,
+                }
+                for c in chunks
+            ],
+            "total_chunks": len(chunks),
+            "total_bytes": sum(c.size_bytes for c in chunks),
         }
 
 
