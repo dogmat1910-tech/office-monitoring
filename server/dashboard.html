@@ -205,6 +205,55 @@
       line-height: 1.6; white-space: pre-wrap; font-size: 13px; margin-top: 8px;
     }
 
+    /* Daily Report */
+    .daily-controls { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; }
+    .daily-controls input[type="date"] {
+      background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+      border-radius: 6px; padding: 6px 10px; font-size: 13px;
+    }
+    .btn-primary {
+      background: var(--accent); color: #0f172a; border: none; border-radius: 6px;
+      padding: 7px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+    }
+    .btn-primary:hover { filter: brightness(1.1); }
+    .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+    .btn-secondary {
+      background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+      border-radius: 6px; padding: 7px 14px; font-size: 13px; cursor: pointer;
+    }
+    .btn-secondary:hover { border-color: var(--accent); }
+
+    .daily-report { display: grid; gap: 16px; }
+    .daily-header { display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: start; }
+    .daily-score-big {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      width: 90px; height: 90px; border-radius: 50%; font-weight: 700;
+      border: 4px solid var(--border);
+    }
+    .daily-score-big.low { background: #7f1d1d; border-color: #b91c1c; color: #fecaca; }
+    .daily-score-big.mid { background: #92400e; border-color: #d97706; color: #fde68a; }
+    .daily-score-big.high { background: #14532d; border-color: #16a34a; color: #bbf7d0; }
+    .daily-score-big .num { font-size: 28px; line-height: 1; }
+    .daily-score-big .lbl { font-size: 10px; color: inherit; opacity: 0.85; margin-top: 4px; }
+    .daily-summary { background: #1e3a5f; border-radius: 8px; padding: 14px 16px; line-height: 1.6; }
+    .daily-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .daily-section {
+      background: var(--panel-2); border-radius: 8px; padding: 14px;
+      border-top: 3px solid var(--border);
+    }
+    .daily-section.meetings { border-top-color: #fbbf24; }
+    .daily-section.calls { border-top-color: #4ade80; }
+    .daily-section.proc { border-top-color: #f87171; }
+    .daily-section h3 { margin: 0 0 8px; text-transform: none; letter-spacing: 0; color: var(--text); font-size: 14px; }
+    .daily-section .big-num { font-size: 24px; font-weight: 700; margin: 6px 0; }
+    .daily-section ul { margin: 8px 0 0; padding-left: 18px; font-size: 13px; line-height: 1.5; }
+    .daily-section ul li { margin: 3px 0; }
+    .daily-meta { color: var(--muted); font-size: 12px; }
+    .daily-redflags { background: #7f1d1d; border-radius: 8px; padding: 14px 16px; }
+    .daily-redflags h3 { color: #fecaca; margin: 0 0 6px; text-transform: none; letter-spacing: 0; font-size: 14px; }
+    .daily-recommendations { background: var(--panel); border-radius: 8px; padding: 14px 16px; }
+    .daily-recommendations h3 { margin: 0 0 6px; text-transform: none; letter-spacing: 0; color: var(--accent); font-size: 14px; }
+
     /* Voice segments */
     .voice-seg {
       display: grid; grid-template-columns: 70px 70px 1fr; gap: 10px;
@@ -264,6 +313,7 @@
         <button class="tab" data-tab="meetings">Встречи</button>
         <button class="tab" data-tab="voice">Голос</button>
         <button class="tab" data-tab="windows">Окна</button>
+        <button class="tab" data-tab="daily">Daily Report</button>
       </nav>
 
       <!-- Tab: Сегодня — детальный барчарт приложений и доменов -->
@@ -295,6 +345,21 @@
         <div class="panel">
           <h2>Последние окна</h2>
           <div id="windowsTable"></div>
+        </div>
+      </div>
+
+      <!-- Tab: Daily Report -->
+      <div class="tab-content" data-tab-content="daily" hidden>
+        <div class="panel">
+          <h2>Daily Report</h2>
+          <div class="daily-controls">
+            <label class="muted">Дата:
+              <input type="date" id="dailyDate">
+            </label>
+            <button id="dailyGenerate" class="btn-primary">Сгенерировать</button>
+            <button id="dailyRegenerate" class="btn-secondary" hidden>Перегенерировать</button>
+          </div>
+          <div id="dailyContent"></div>
         </div>
       </div>
     </section>
@@ -635,6 +700,174 @@
           </tr>`).join("")}</tbody>
       </table>`;
     }
+
+    // ───────────── Tab: Daily Report ─────────────
+    let dailyPollTimer = null;
+
+    function todayLocal() {
+      const d = new Date();
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      return `${y}-${m}-${day}`;
+    }
+
+    function renderDailyEmpty(msg) {
+      $("#dailyRegenerate").hidden = true;
+      $("#dailyContent").innerHTML = `<div class="empty">${msg}</div>`;
+    }
+
+    function renderDailyPending() {
+      $("#dailyRegenerate").hidden = true;
+      $("#dailyContent").innerHTML = '<div class="empty">⏳ LLM генерирует отчёт... обычно 10-30 секунд</div>';
+    }
+
+    function renderDailyError(msg) {
+      $("#dailyRegenerate").hidden = false;
+      $("#dailyContent").innerHTML = `<div class="empty">❌ ошибка: ${escapeHTML(msg || "неизвестная")}</div>`;
+    }
+
+    function dailyScoreClass(s) {
+      if (s == null) return "low";
+      if (s <= 4) return "low";
+      if (s <= 7) return "mid";
+      return "high";
+    }
+
+    function renderDailyReport(d) {
+      $("#dailyRegenerate").hidden = false;
+      const p = d.payload || {};
+      const score = d.productivity_score ?? p.productivity_score;
+      const m = p.meetings || {};
+      const c = p.phone_calls || {};
+      const pr = p.procrastination || {};
+
+      const meetings_html = `
+        <div class="daily-section meetings">
+          <h3>🗓 Встречи</h3>
+          <div class="big-num">${m.count || 0}</div>
+          <div class="daily-meta">всего ${fmtSec(m.total_seconds || 0)}, ср. оценка ${m.average_score != null ? m.average_score : "?"}/10</div>
+          ${(m.key_observations || []).length ? `<ul>${m.key_observations.map(x => `<li>${escapeHTML(x)}</li>`).join("")}</ul>` : ""}
+          ${(m.top_strengths || []).length ? `<div class="daily-meta" style="margin-top:8px;"><strong>Сильные:</strong></div><ul>${m.top_strengths.map(x => `<li>${escapeHTML(x)}</li>`).join("")}</ul>` : ""}
+          ${(m.top_growth_areas || []).length ? `<div class="daily-meta" style="margin-top:8px;"><strong>Зоны роста:</strong></div><ul>${m.top_growth_areas.map(x => `<li>${escapeHTML(x)}</li>`).join("")}</ul>` : ""}
+        </div>`;
+
+      const calls_html = `
+        <div class="daily-section calls">
+          <h3>📞 Звонки</h3>
+          <div class="big-num">${(c.estimated_work_calls_count || 0) + (c.estimated_personal_calls_count || 0)}</div>
+          <div class="daily-meta">раб.: ${c.estimated_work_calls_count || 0} · личн.: ${c.estimated_personal_calls_count || 0}</div>
+          <div class="daily-meta">голос вне встреч: ${fmtSec(c.voice_outside_meetings_seconds || 0)}</div>
+          ${(c.key_observations || []).length ? `<ul>${c.key_observations.map(x => `<li>${escapeHTML(x)}</li>`).join("")}</ul>` : ""}
+        </div>`;
+
+      const proc_html = `
+        <div class="daily-section proc">
+          <h3>🚫 Прокрастинация</h3>
+          <div class="big-num">${fmtSec(pr.personal_seconds || 0)}</div>
+          ${(pr.top_distractions || []).length ? `<ul>${pr.top_distractions.map(x => `<li>${escapeHTML(x.name)}: ${fmtSec(x.seconds || 0)}</li>`).join("")}</ul>` : '<div class="daily-meta">личного не зафиксировано</div>'}
+          ${(pr.observations || []).length ? `<div class="daily-meta" style="margin-top:8px;"><strong>Наблюдения:</strong></div><ul>${pr.observations.map(x => `<li>${escapeHTML(x)}</li>`).join("")}</ul>` : ""}
+        </div>`;
+
+      const redflags_html = (p.red_flags || []).length ? `
+        <div class="daily-redflags">
+          <h3>🚨 Red flags</h3>
+          <ul>${p.red_flags.map(x => `<li>${escapeHTML(x)}</li>`).join("")}</ul>
+        </div>` : "";
+
+      const rec_html = (p.recommendations || []).length ? `
+        <div class="daily-recommendations">
+          <h3>💡 Рекомендации</h3>
+          <ul>${p.recommendations.map(x => `<li>${escapeHTML(x)}</li>`).join("")}</ul>
+        </div>` : "";
+
+      $("#dailyContent").innerHTML = `
+        <div class="daily-report">
+          <div class="daily-header">
+            <div class="daily-summary">${escapeHTML(p.overall_summary || "(нет общего саммари)")}</div>
+            <div class="daily-score-big ${dailyScoreClass(score)}">
+              <div class="num">${score != null ? score : "?"}</div>
+              <div class="lbl">из 10</div>
+            </div>
+          </div>
+          <div class="daily-grid">
+            ${meetings_html}
+            ${calls_html}
+            ${proc_html}
+          </div>
+          ${redflags_html}
+          ${rec_html}
+          <div class="daily-meta">модель: ${escapeHTML(d.model || "?")} · обработано за ${(d.processing_time_seconds || 0).toFixed(1)} с · готов ${d.completed_at ? fmtTime(d.completed_at) : "?"}</div>
+        </div>`;
+    }
+
+    async function pollDailyReport(agentId, date) {
+      try {
+        const r = await fetch(`/agents/${agentId}/daily_report?date=${date}`);
+        const d = await r.json();
+        if (d.status === "done") {
+          renderDailyReport(d);
+          clearDailyPoll();
+        } else if (d.status === "error") {
+          renderDailyError(d.error_message);
+          clearDailyPoll();
+        } else if (d.status === "pending") {
+          renderDailyPending();
+        } else {
+          renderDailyEmpty('Отчёт за этот день ещё не сгенерирован. Нажми «Сгенерировать».');
+          clearDailyPoll();
+        }
+      } catch (e) {
+        renderDailyError(String(e));
+        clearDailyPoll();
+      }
+    }
+
+    function clearDailyPoll() {
+      if (dailyPollTimer) { clearInterval(dailyPollTimer); dailyPollTimer = null; }
+    }
+
+    function startDailyPoll(agentId, date) {
+      clearDailyPoll();
+      pollDailyReport(agentId, date);
+      dailyPollTimer = setInterval(() => pollDailyReport(agentId, date), 5000);
+    }
+
+    async function generateDailyReport(regenerate = false) {
+      if (!selectedAgent) { alert("выбери агента"); return; }
+      const date = $("#dailyDate").value || todayLocal();
+      const endpoint = regenerate
+        ? `/agents/${selectedAgent}/daily_report/regenerate?date=${date}`
+        : `/agents/${selectedAgent}/daily_report?date=${date}`;
+      renderDailyPending();
+      try {
+        const r = await fetch(endpoint, { method: "POST" });
+        if (!r.ok) { renderDailyError(`HTTP ${r.status} ${await r.text()}`); return; }
+        startDailyPoll(selectedAgent, date);
+      } catch (e) {
+        renderDailyError(String(e));
+      }
+    }
+
+    $("#dailyDate").value = todayLocal();
+    $("#dailyGenerate").addEventListener("click", () => generateDailyReport(false));
+    $("#dailyRegenerate").addEventListener("click", () => generateDailyReport(true));
+    $("#dailyDate").addEventListener("change", () => {
+      if (selectedAgent) pollDailyReport(selectedAgent, $("#dailyDate").value);
+    });
+
+    // при переключении на вкладку daily — автоматом подгружаем отчёт за выбранную дату
+    const origApplyTab = applyTab;
+    applyTab = function(name) {
+      origApplyTab(name);
+      if (name === "daily" && selectedAgent) {
+        pollDailyReport(selectedAgent, $("#dailyDate").value);
+      } else {
+        clearDailyPoll();
+      }
+    };
+    $$(".tab").forEach(b => b.removeEventListener("click", () => {}));  // no-op, прежний listener уже стоит на origApplyTab
+    $$(".tab").forEach(b => b.addEventListener("click", () => applyTab(b.dataset.tab)));
 
     // ───────────── Init ─────────────
     const savedToken = localStorage.getItem("omToken");
