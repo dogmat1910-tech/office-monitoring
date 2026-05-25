@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Секреты и конфиги
+.env
+.env.*
+secrets.toml
+*.key
+*.pem
+config.local.*
+
+# БД
+*.db
+*.sqlite
+*.sqlite3
+
+# Логи и временные файлы
+*.log
+logs/
+tmp/
+temp/
+
+# Аудио и скриншоты (никогда не коммитим)
+*.wav
+*.mp3
+*.ogg
+*.opus
+*.png
+*.jpg
+*.jpeg
+audio_data/
+screenshots/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# PyInstaller
+*.spec
+agent_dist/
