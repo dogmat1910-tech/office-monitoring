@@ -152,21 +152,49 @@ class VoiceSegment(SQLModel, table=True):
     started_at: datetime = Field(index=True)
     ended_at: datetime
     duration_seconds: float
-    file_path: str  # относительно VOICE_DIR
+    file_path: str
     format: str = "opus"
     size_bytes: int
     received_at: datetime
-    # после транскрипции:
     text: str | None = None
     language: str | None = None
     transcribed_at: datetime | None = None
-    # классификация LLM-ом (этап 13):
-    # meeting | phone_work | phone_personal | office_chat | other_speech | noise
     kind: str | None = Field(default=None, index=True)
     kind_summary: str | None = None
     kind_confidence: float | None = None
     classified_at: datetime | None = None
     meeting_id: int | None = Field(default=None, index=True)
+    conversation_id: int | None = Field(default=None, index=True)
+
+
+class Conversation(SQLModel, table=True):
+    """Группа последовательных VoiceSegment'ов с паузами < CLUSTER_GAP_SECONDS.
+    Один разговор = одно «событие» (встреча, звонок, болтовня, ...).
+    LLM анализирует разговор целиком, а не каждый сегмент по отдельности."""
+    id: int | None = Field(default=None, primary_key=True)
+    agent_id: str = Field(index=True)
+    started_at: datetime = Field(index=True)
+    ended_at: datetime
+    duration_seconds: float
+    segment_count: int
+    full_text: str | None = None  # кэш: склейка transcript'ов сегментов
+    clustered_at: datetime
+
+    # Заполняется этапом B (LLM-анализ):
+    kind: str | None = Field(default=None, index=True)
+    confidence: float | None = None
+    is_with_client: bool | None = None
+    is_sale_attempt: bool | None = None
+    is_sale_closed: bool | None = None
+    sale_quality_score: int | None = None
+    summary: str | None = None
+    payload_json: str | None = None
+    analyzed_at: datetime | None = None
+
+    # Связь с meeting (по кнопке календаря):
+    related_meeting_id: int | None = Field(default=None, index=True)
+    # matched | missed_button | no_recording | standalone
+    sync_status: str | None = Field(default=None, index=True)
 
 
 class HeartbeatIn(BaseModel):
@@ -1025,6 +1053,136 @@ async def upload_voice_segment(
         session.commit()
         session.refresh(seg)
         return {"status": "ok", "segment_id": seg.id, "size_bytes": len(contents), "duration_seconds": duration}
+
+
+@app.get("/agents/{agent_id}/conversations")
+def list_conversations(agent_id: str, hours: int = 24, limit: int = 100) -> list[dict]:
+    """Сгруппированные разговоры (последовательные voice segments) за период."""
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    with Session(engine) as session:
+        rows = session.exec(
+            select(Conversation)
+            .where(Conversation.agent_id == agent_id)
+            .where(Conversation.started_at >= since)
+            .order_by(Conversation.started_at.desc())
+            .limit(limit)
+        ).all()
+        return [
+            {
+                "conversation_id": c.id,
+                "started_at": _as_utc(c.started_at).isoformat(),
+                "ended_at": _as_utc(c.ended_at).isoformat(),
+                "duration_seconds": c.duration_seconds,
+                "segment_count": c.segment_count,
+                "full_text": c.full_text,
+                "kind": c.kind,
+                "confidence": c.confidence,
+                "is_with_client": c.is_with_client,
+                "is_sale_attempt": c.is_sale_attempt,
+                "is_sale_closed": c.is_sale_closed,
+                "sale_quality_score": c.sale_quality_score,
+                "summary": c.summary,
+                "related_meeting_id": c.related_meeting_id,
+                "sync_status": c.sync_status,
+                "analyzed_at": _as_utc(c.analyzed_at).isoformat() if c.analyzed_at else None,
+            }
+            for c in rows
+        ]
+
+
+@app.get("/agents/{agent_id}/conversations_summary")
+def conversations_summary(agent_id: str, hours: int = 24) -> dict:
+    """Сводка: сколько разговоров каждого типа, сверка кнопка vs запись."""
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    with Session(engine) as session:
+        convs = session.exec(
+            select(Conversation)
+            .where(Conversation.agent_id == agent_id)
+            .where(Conversation.started_at >= since)
+        ).all()
+        by_kind: dict[str, dict] = {}
+        sales_attempts = 0
+        sales_closed = 0
+        for c in convs:
+            kind = c.kind or "unclassified"
+            if kind not in by_kind:
+                by_kind[kind] = {"count": 0, "duration_seconds": 0}
+            by_kind[kind]["count"] += 1
+            by_kind[kind]["duration_seconds"] += int(c.duration_seconds or 0)
+            if c.is_sale_attempt:
+                sales_attempts += 1
+            if c.is_sale_closed:
+                sales_closed += 1
+
+        # встречи по кнопке за тот же период
+        meetings = session.exec(
+            select(Meeting)
+            .where(Meeting.agent_id == agent_id)
+            .where(Meeting.started_at >= since)
+        ).all()
+        meetings_by_button = len(meetings)
+        meetings_by_recording = by_kind.get("meeting", {}).get("count", 0)
+
+        # missed buttons: встречи по кнопке без conversation
+        meetings_with_conv = {c.related_meeting_id for c in convs if c.related_meeting_id}
+        meetings_without_recording = [m.id for m in meetings if m.id not in meetings_with_conv]
+
+        # missed recordings: conversations с kind=meeting без related_meeting_id
+        conversations_without_button = sum(
+            1 for c in convs if c.kind == "meeting" and not c.related_meeting_id
+        )
+
+        return {
+            "agent_id": agent_id,
+            "hours": hours,
+            "total_conversations": len(convs),
+            "by_kind": by_kind,
+            "meetings_by_button": meetings_by_button,
+            "meetings_by_recording": meetings_by_recording,
+            "meetings_without_recording": meetings_without_recording,
+            "conversations_without_button": conversations_without_button,
+            "sales_attempts": sales_attempts,
+            "sales_closed": sales_closed,
+        }
+
+
+@app.get("/conversations/{conversation_id}")
+def get_conversation(conversation_id: int) -> dict:
+    import json as _json
+    with Session(engine) as session:
+        c = session.exec(select(Conversation).where(Conversation.id == conversation_id)).first()
+        if c is None:
+            raise HTTPException(404, "conversation не найден")
+        segs = session.exec(
+            select(VoiceSegment).where(VoiceSegment.conversation_id == conversation_id).order_by(VoiceSegment.started_at)
+        ).all()
+        return {
+            "conversation_id": c.id,
+            "agent_id": c.agent_id,
+            "started_at": _as_utc(c.started_at).isoformat(),
+            "ended_at": _as_utc(c.ended_at).isoformat(),
+            "duration_seconds": c.duration_seconds,
+            "full_text": c.full_text,
+            "kind": c.kind,
+            "summary": c.summary,
+            "is_with_client": c.is_with_client,
+            "is_sale_attempt": c.is_sale_attempt,
+            "is_sale_closed": c.is_sale_closed,
+            "sale_quality_score": c.sale_quality_score,
+            "related_meeting_id": c.related_meeting_id,
+            "sync_status": c.sync_status,
+            "payload": _json.loads(c.payload_json) if c.payload_json else None,
+            "segments": [
+                {
+                    "segment_id": s.id,
+                    "started_at": _as_utc(s.started_at).isoformat(),
+                    "duration_seconds": s.duration_seconds,
+                    "text": s.text,
+                    "kind": s.kind,
+                }
+                for s in segs
+            ],
+        }
 
 
 @app.get("/agents/{agent_id}/voice_segments")

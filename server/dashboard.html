@@ -367,6 +367,7 @@
         <button class="tab" data-tab="today">Сегодня</button>
         <button class="tab" data-tab="meetings">Встречи</button>
         <button class="tab" data-tab="voice">Голос</button>
+        <button class="tab" data-tab="conversations">Разговоры</button>
         <button class="tab" data-tab="windows">Окна</button>
         <button class="tab" data-tab="daily">Daily Report</button>
       </nav>
@@ -421,6 +422,15 @@
         <div class="panel">
           <h2>Голосовая активность (always-on)</h2>
           <div id="voiceList"></div>
+        </div>
+      </div>
+
+      <!-- Tab: Разговоры -->
+      <div class="tab-content" data-tab-content="conversations" hidden>
+        <div id="conversationsSummary" class="day-summary"></div>
+        <div class="panel">
+          <h2>Разговоры (кластеры голосовых сегментов)</h2>
+          <div id="conversationsList"></div>
         </div>
       </div>
 
@@ -571,18 +581,22 @@
     async function loadAgentData() {
       if (!selectedAgent) return;
       const hours = $("#hours").value;
-      const [daySummaryR, windowsR, meetingsR, voiceR, activityR] = await Promise.all([
+      const [daySummaryR, windowsR, meetingsR, voiceR, activityR, convListR, convSumR] = await Promise.all([
         fetch(`/agents/${selectedAgent}/day_summary?hours=${hours}`),
         fetch(`/agents/${selectedAgent}/windows?limit=50`),
         fetch(`/meetings?agent_id=${selectedAgent}&limit=20`),
         fetch(`/agents/${selectedAgent}/voice_segments?hours=${hours}&limit=100`),
         fetch(`/agents/${selectedAgent}/activity_summary?hours=${hours}`),
+        fetch(`/agents/${selectedAgent}/conversations?hours=${hours}&limit=50`),
+        fetch(`/agents/${selectedAgent}/conversations_summary?hours=${hours}`),
       ]);
       const daySummary = await daySummaryR.json();
       const windows = await windowsR.json();
       const meetings = await meetingsR.json();
       const voice = await voiceR.json();
       const activity = await activityR.json();
+      const conversations = await convListR.json();
+      const convSum = await convSumR.json();
 
       renderDayTiles(daySummary);
       renderActivityTiles(activity);
@@ -592,7 +606,46 @@
       renderMeetings(meetings);
       renderVoice(voice);
       renderWindows(windows);
+      renderConversations(conversations, convSum);
       $("#updated").textContent = "обновлено " + fmtTime(new Date().toISOString());
+    }
+
+    function renderConversations(convs, summary) {
+      // плитки сводки
+      const sumEl = $("#conversationsSummary");
+      const meetings_diff = (summary.meetings_by_recording || 0) - (summary.meetings_by_button || 0);
+      const diff_text = meetings_diff > 0 ? `+${meetings_diff} не нажал` : meetings_diff < 0 ? `-${-meetings_diff} нет записи` : "совпадает";
+      sumEl.innerHTML = `
+        <div class="day-tile meeting"><div class="label">встречи по записи</div><div class="value">${summary.meetings_by_recording || 0}</div></div>
+        <div class="day-tile work"><div class="label">встречи по кнопке</div><div class="value">${summary.meetings_by_button || 0}</div></div>
+        <div class="day-tile ${meetings_diff !== 0 ? 'personal' : 'neutral'}"><div class="label">расхождение</div><div class="value" style="font-size:14px">${diff_text}</div></div>
+        <div class="day-tile neutral"><div class="label">всего разговоров</div><div class="value">${summary.total_conversations || 0}</div></div>`;
+
+      // список
+      const el = $("#conversationsList");
+      if (!convs.length) {
+        el.innerHTML = '<div class="empty">разговоров за этот период нет</div>';
+        return;
+      }
+      el.innerHTML = `<table>
+        <thead><tr>
+          <th>Время</th><th>Длит.</th><th>Тип</th><th>Краткое содержание</th><th>Кнопка</th>
+        </tr></thead>
+        <tbody>${convs.map(c => {
+          const kindBadge = c.kind ? `<span class="kind ${c.kind}">${kindLabel(c.kind)}</span>` : '<span class="muted">⏳ анализ...</span>';
+          const sync = c.sync_status === 'matched' ? '<span class="badge meeting">✓ совпала</span>'
+                     : (c.kind === 'meeting' && !c.related_meeting_id) ? '<span class="badge meeting" style="background:#b91c1c">⚠ без кнопки</span>'
+                     : '—';
+          const preview = c.summary || (c.full_text ? c.full_text.slice(0, 120) + "..." : "(пусто)");
+          return `<tr class="meeting-row" data-cid="${c.conversation_id}">
+            <td>${fmtTime(c.started_at)}</td>
+            <td class="num">${fmtSec(Math.round(c.duration_seconds))}</td>
+            <td>${kindBadge}</td>
+            <td>${escapeHTML(preview)}</td>
+            <td>${sync}</td>
+          </tr>`;
+        }).join("")}</tbody>
+      </table>`;
     }
 
     function renderActivityTiles(a) {

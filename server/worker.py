@@ -22,6 +22,7 @@ from sqlmodel import Session, select
 from main import AUDIO_DIR, VOICE_DIR, Analysis, AudioChunk, DailyReport, Meeting, Transcript, VoiceSegment, engine
 from analyze import analyze_transcript
 from classify_voice import auto_bind_meeting_id, classify_voice_segment
+from conversations import cluster_pending_segments, get_active_agents_with_pending_segments
 from daily_report import generate_daily_report
 from transcribe import get_model, transcribe_meeting, transcribe_voice_segment
 
@@ -287,6 +288,12 @@ def process_one() -> bool:
     if seg_id is not None:
         process_voice_classification(seg_id)
         return True
+
+    # Этап 2.7: кластеризация сегментов в conversations
+    for agent_id in get_active_agents_with_pending_segments():
+        n = cluster_pending_segments(agent_id)
+        if n:
+            return True  # делаем по одному агенту за итерацию
 
     # Этап 3: pending daily reports
     pending_report = find_pending_daily_report()
