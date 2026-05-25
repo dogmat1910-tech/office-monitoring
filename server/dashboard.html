@@ -118,6 +118,26 @@
     .twocol { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 10px; }
     .twocol h4 { font-size: 13px; margin: 0 0 6px; color: var(--muted); font-weight: 600; }
     .twocol ul { margin: 0; padding-left: 20px; line-height: 1.5; font-size: 13px; }
+    .bar-fill.work { background: #4ade80; }
+    .bar-fill.personal { background: #f87171; }
+    .bar-fill.neutral { background: #94a3b8; }
+    .cat-select {
+      background: #0b1220; color: var(--text); border: 1px solid var(--border);
+      border-radius: 4px; font-size: 11px; padding: 2px 4px;
+    }
+    .day-summary {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 14px;
+    }
+    .day-tile {
+      background: #0b1220; border-radius: 8px; padding: 10px 12px;
+      border-left: 4px solid var(--muted);
+    }
+    .day-tile.work { border-left-color: #4ade80; }
+    .day-tile.personal { border-left-color: #f87171; }
+    .day-tile.neutral { border-left-color: #94a3b8; }
+    .day-tile.meeting { border-left-color: #fbbf24; }
+    .day-tile .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .day-tile .value { font-size: 20px; font-weight: 700; margin-top: 2px; }
     .token-input {
       width: 100%; box-sizing: border-box; background: #0b1220; color: var(--text);
       border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
@@ -151,8 +171,8 @@
     </aside>
     <section>
       <div class="panel">
-        <h2 style="margin-top: 0;">Сводка по приложениям</h2>
-        <div id="summary"></div>
+        <h2 style="margin-top: 0;">Сводка дня</h2>
+        <div id="daySummary"></div>
       </div>
       <div class="panel">
         <h2 style="margin-top: 0;">Встречи</h2>
@@ -244,15 +264,15 @@
     async function loadAgentData() {
       if (!selectedAgent) return;
       const hours = $("#hours").value;
-      const [summaryR, windowsR, meetingsR] = await Promise.all([
-        fetch(`/agents/${selectedAgent}/summary?hours=${hours}`),
+      const [daySummaryR, windowsR, meetingsR] = await Promise.all([
+        fetch(`/agents/${selectedAgent}/day_summary?hours=${hours}`),
         fetch(`/agents/${selectedAgent}/windows?limit=50`),
         fetch(`/meetings?agent_id=${selectedAgent}&limit=20`),
       ]);
-      const summary = await summaryR.json();
+      const daySummary = await daySummaryR.json();
       const windows = await windowsR.json();
       const meetings = await meetingsR.json();
-      renderSummary(summary);
+      renderDaySummary(daySummary);
       renderWindows(windows);
       renderMeetings(meetings);
       $("#updated").textContent = "обновлено " + fmtTime(new Date().toISOString());
@@ -413,24 +433,49 @@
       panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
 
-    function renderSummary(summary) {
-      const el = $("#summary");
-      if (!summary.by_app.length) {
-        el.innerHTML = '<div class="empty">пусто за этот период</div>';
+    function renderDaySummary(d) {
+      const el = $("#daySummary");
+      const by = d.by_category || {};
+      const tiles = `
+        <div class="day-summary">
+          <div class="day-tile work"><div class="label">работа</div><div class="value">${fmtSec(by.work || 0)}</div></div>
+          <div class="day-tile meeting"><div class="label">встречи</div><div class="value">${fmtSec(d.meeting_seconds || 0)}</div></div>
+          <div class="day-tile personal"><div class="label">личное</div><div class="value">${fmtSec(by.personal || 0)}</div></div>
+          <div class="day-tile neutral"><div class="label">нейтр./не определено</div><div class="value">${fmtSec(by.neutral || 0)}</div></div>
+        </div>`;
+      if (!d.by_app.length) {
+        el.innerHTML = tiles + '<div class="empty">пусто за этот период</div>';
         return;
       }
-      const max = summary.by_app[0].seconds;
-      el.innerHTML = `
-        <div class="muted" style="margin-bottom: 10px;">всего: ${fmtSec(summary.total_seconds)} · период: ${summary.hours} ч</div>
-        ${summary.by_app.map(item => {
+      const max = Math.max(...d.by_app.map(x => x.seconds));
+      el.innerHTML = tiles + `
+        <div class="muted" style="margin-bottom: 8px; font-size: 12px;">
+          трекинг: ${fmtSec(d.total_tracked_seconds)} · встреч: ${d.meetings_count} · период: ${d.hours} ч
+        </div>
+        ${d.by_app.map(item => {
           const pct = max > 0 ? (item.seconds / max * 100).toFixed(1) : 0;
           return `<div class="bar-row">
-            <div class="name">${escapeHTML(item.app_name)}</div>
-            <div class="bar-bg"><div class="bar-fill" style="width:${pct}%"></div></div>
+            <div class="name">
+              ${escapeHTML(item.app_name)}
+              <select class="cat-select" data-app="${escapeHTML(item.app_name)}">
+                <option value="work" ${item.category === 'work' ? 'selected' : ''}>работа</option>
+                <option value="neutral" ${item.category === 'neutral' ? 'selected' : ''}>нейтр.</option>
+                <option value="personal" ${item.category === 'personal' ? 'selected' : ''}>личное</option>
+              </select>
+            </div>
+            <div class="bar-bg"><div class="bar-fill ${item.category}" style="width:${pct}%"></div></div>
             <div class="num">${fmtSec(item.seconds)}</div>
           </div>`;
         }).join("")}
       `;
+      el.querySelectorAll(".cat-select").forEach(s => s.addEventListener("change", async () => {
+        await fetch("/app_categories", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ app_name: s.dataset.app, category: s.value }),
+        });
+        loadAgentData();
+      }));
     }
 
     function renderWindows(windows) {

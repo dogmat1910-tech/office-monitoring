@@ -86,6 +86,15 @@ class Analysis(SQLModel, table=True):
     processing_time_seconds: float | None = None
 
 
+class AppCategory(SQLModel, table=True):
+    """Категория приложения — work | personal | neutral.
+    Назначается глобально (одно правило для всех агентов)."""
+    id: int | None = Field(default=None, primary_key=True)
+    app_name: str = Field(index=True, unique=True)
+    category: str  # work | personal | neutral
+    updated_at: datetime
+
+
 class HeartbeatIn(BaseModel):
     agent_id: str
     hostname: str
@@ -346,6 +355,142 @@ def get_active_meeting(agent_id: str) -> dict:
             "meeting_id": meeting.id,
             "started_at": _as_utc(meeting.started_at).isoformat(),
             "client_name": meeting.client_name,
+        }
+
+
+# ---------- app categories ----------
+
+# Дефолтный словарь категорий: ключи — app_name (как видит ОС), значения — категория.
+# Используется на лету пока пользователь не переопределил в БД.
+DEFAULT_CATEGORIES: dict[str, str] = {
+    # Корп. инструменты — work
+    "AmoCRM": "work", "amoCRM": "work",
+    "Outlook": "work", "Microsoft Outlook": "work",
+    "Word": "work", "Microsoft Word": "work",
+    "Excel": "work", "Microsoft Excel": "work",
+    "PowerPoint": "work",
+    "Skorozvon": "work",
+    "Zoom": "work", "zoom.us": "work",
+    "Telemost": "work",
+    "Яндекс.Браузер": "work",
+    # Мессенджеры — neutral (могут быть рабочими, могут личными)
+    "Telegram": "neutral", "Telegram Lite": "neutral",
+    "WhatsApp": "neutral",
+    "ВКонтакте": "neutral",
+    # Браузеры — neutral (зависит от сайта)
+    "Google Chrome": "neutral", "Chrome": "neutral",
+    "Safari": "neutral",
+    "Firefox": "neutral",
+    "Microsoft Edge": "neutral",
+    # Системные/инструменты
+    "Finder": "neutral", "Explorer": "neutral", "Windows Explorer": "neutral",
+    "Terminal": "neutral", "iTerm2": "neutral", "Windows Terminal": "neutral",
+    "System Settings": "neutral", "Системные настройки": "neutral",
+    # Личное
+    "YouTube": "personal",
+    "TikTok": "personal",
+    "Instagram": "personal",
+    "Spotify": "personal",
+    "Steam": "personal",
+    "Discord": "personal",
+}
+
+
+def get_category_map(session: Session) -> dict[str, str]:
+    """Объединяет дефолтный словарь с пользовательскими переопределениями."""
+    merged = dict(DEFAULT_CATEGORIES)
+    user_rules = session.exec(select(AppCategory)).all()
+    for r in user_rules:
+        merged[r.app_name] = r.category
+    return merged
+
+
+class AppCategoryIn(BaseModel):
+    app_name: str
+    category: str  # work | personal | neutral
+
+
+@app.get("/app_categories")
+def list_app_categories() -> dict:
+    """Все известные приложения с их категориями (дефолт + пользовательские)."""
+    with Session(engine) as session:
+        merged = get_category_map(session)
+        user_overrides = {r.app_name for r in session.exec(select(AppCategory)).all()}
+    return {
+        "categories": [
+            {"app_name": k, "category": v, "user_defined": k in user_overrides}
+            for k, v in sorted(merged.items())
+        ]
+    }
+
+
+@app.post("/app_categories")
+def set_app_category(payload: AppCategoryIn) -> dict:
+    if payload.category not in ("work", "personal", "neutral"):
+        raise HTTPException(400, "category должен быть work | personal | neutral")
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        existing = session.exec(select(AppCategory).where(AppCategory.app_name == payload.app_name)).first()
+        if existing:
+            existing.category = payload.category
+            existing.updated_at = now
+            session.add(existing)
+        else:
+            session.add(AppCategory(app_name=payload.app_name, category=payload.category, updated_at=now))
+        session.commit()
+    return {"status": "ok", "app_name": payload.app_name, "category": payload.category}
+
+
+@app.get("/agents/{agent_id}/day_summary")
+def agent_day_summary(agent_id: str, hours: int = 24) -> dict:
+    """Свод дня менеджера: время по категориям + список приложений в каждой категории + время на встречах."""
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    with Session(engine) as session:
+        cat_map = get_category_map(session)
+
+        # окна по приложениям
+        rows = session.exec(
+            select(WindowSample.app_name, func.sum(WindowSample.duration_seconds))
+            .where(WindowSample.agent_id == agent_id)
+            .where(WindowSample.captured_at >= since)
+            .group_by(WindowSample.app_name)
+        ).all()
+
+        by_category: dict[str, int] = {"work": 0, "personal": 0, "neutral": 0}
+        by_app: dict[str, dict] = {}
+        for app_name, secs in rows:
+            app_name = app_name or "unknown"
+            secs = int(secs or 0)
+            cat = cat_map.get(app_name, "neutral")
+            by_category[cat] = by_category.get(cat, 0) + secs
+            by_app[app_name] = {"seconds": secs, "category": cat}
+
+        # время на встречах
+        meetings = session.exec(
+            select(Meeting)
+            .where(Meeting.agent_id == agent_id)
+            .where(Meeting.ended_at.is_not(None))
+            .where(Meeting.ended_at >= since)
+        ).all()
+        meeting_seconds = sum(
+            int((_as_utc(m.ended_at) - _as_utc(m.started_at)).total_seconds())
+            for m in meetings
+            if m.ended_at
+        )
+
+        total_tracked = sum(by_category.values())
+        return {
+            "agent_id": agent_id,
+            "hours": hours,
+            "since": since.isoformat(),
+            "total_tracked_seconds": total_tracked,
+            "meeting_seconds": meeting_seconds,
+            "by_category": by_category,
+            "by_app": [
+                {"app_name": k, **v}
+                for k, v in sorted(by_app.items(), key=lambda x: -x[1]["seconds"])
+            ],
+            "meetings_count": len(meetings),
         }
 
 
