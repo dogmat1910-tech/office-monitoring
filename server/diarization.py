@@ -49,7 +49,7 @@ def get_pipeline():
         import torch  # type: ignore
         log.info("loading diarization pipeline %s", MODEL_NAME)
         t0 = time.monotonic()
-        _pipeline = Pipeline.from_pretrained(MODEL_NAME, use_auth_token=HF_TOKEN)
+        _pipeline = Pipeline.from_pretrained(MODEL_NAME, token=HF_TOKEN)
         _pipeline.to(torch.device("cpu"))
         log.info("diarization pipeline loaded in %.1fs", time.monotonic() - t0)
         return _pipeline
