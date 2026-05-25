@@ -76,7 +76,32 @@
     th { color: var(--muted); font-weight: 500; }
     td.num { text-align: right; font-variant-numeric: tabular-nums; }
     .empty { color: var(--muted); padding: 12px; text-align: center; }
-  </style>
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+      margin-left: 6px;
+    }
+    .badge.meeting { background: #b91c1c; color: white; }
+    .meeting-info { margin-top: 6px; padding: 6px 8px; background: #7f1d1d; border-radius: 6px; font-size: 12px; }
+    .meeting-info .client { font-weight: 600; }
+    .meeting-info .since { color: #fecaca; }
+    .actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+    .btn-sim {
+      background: #b45309; color: white; border: none; border-radius: 6px;
+      padding: 6px 10px; font-size: 12px; cursor: pointer;
+    }
+    .btn-sim:hover { background: #d97706; }
+    .btn-sim.stop { background: #b91c1c; }
+    .btn-sim.stop:hover { background: #dc2626; }
+    .token-input {
+      width: 100%; box-sizing: border-box; background: #0b1220; color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
+      font-family: ui-monospace, monospace; font-size: 12px; margin-top: 4px;
+    }
+</style>
 </head>
 <body>
   <header>
@@ -98,11 +123,18 @@
     <aside>
       <h2>Агенты</h2>
       <div id="agents"></div>
+      <h2 style="margin-top: 20px;">API-токен (для теста встреч)</h2>
+      <input type="password" id="apiToken" class="token-input" placeholder="вставь токен сюда" autocomplete="off">
+      <div class="muted" style="font-size: 11px; margin-top: 4px;">хранится в браузере, нужен для кнопок симуляции встречи</div>
     </aside>
     <section>
       <div class="panel">
         <h2 style="margin-top: 0;">Сводка по приложениям</h2>
         <div id="summary"></div>
+      </div>
+      <div class="panel">
+        <h2 style="margin-top: 0;">Встречи</h2>
+        <div id="meetings"></div>
       </div>
       <div class="panel">
         <h2 style="margin-top: 0;">Последние окна</h2>
@@ -134,18 +166,41 @@
         el.innerHTML = '<div class="empty">нет агентов</div>';
         return;
       }
-      el.innerHTML = agents.map(a => `
-        <div class="agent ${a.agent_id === selectedAgent ? 'selected' : ''}" data-id="${a.agent_id}">
-          <div class="name"><span class="dot ${a.online ? 'online' : 'offline'}"></span>${escapeHTML(a.hostname)}</div>
-          <div class="meta">${escapeHTML(a.username)} · ${a.online ? 'online' : 'offline'}</div>
-        </div>
-      `).join("");
+      el.innerHTML = agents.map(a => {
+        const meetingHtml = a.active_meeting ? `
+          <div class="meeting-info">
+            <div><span class="client">${escapeHTML(a.active_meeting.client_name || "встреча")}</span></div>
+            <div class="since">с ${fmtTime(a.active_meeting.started_at)}</div>
+          </div>
+          <div class="actions">
+            <button class="btn-sim stop" data-stop="${a.agent_id}">⏹ остановить</button>
+          </div>` : `
+          <div class="actions">
+            <button class="btn-sim" data-start="${a.agent_id}">▶ симулировать встречу</button>
+          </div>`;
+        return `
+          <div class="agent ${a.agent_id === selectedAgent ? 'selected' : ''}" data-id="${a.agent_id}">
+            <div class="name">
+              <span class="dot ${a.online ? 'online' : 'offline'}"></span>${escapeHTML(a.hostname)}
+              ${a.active_meeting ? '<span class="badge meeting">🔴 встреча</span>' : ''}
+            </div>
+            <div class="meta">${escapeHTML(a.username)} · ${a.online ? 'online' : 'offline'}</div>
+            ${meetingHtml}
+          </div>`;
+      }).join("");
       el.querySelectorAll(".agent").forEach(node => {
-        node.addEventListener("click", () => {
+        node.addEventListener("click", (e) => {
+          if (e.target.closest(".btn-sim")) return;
           selectedAgent = node.dataset.id;
           loadAgents();
           loadAgentData();
         });
+      });
+      el.querySelectorAll("[data-start]").forEach(btn => {
+        btn.addEventListener("click", () => startMeeting(btn.dataset.start));
+      });
+      el.querySelectorAll("[data-stop]").forEach(btn => {
+        btn.addEventListener("click", () => stopMeeting(btn.dataset.stop));
       });
       if (!selectedAgent && agents.length) {
         selectedAgent = agents[0].agent_id;
@@ -157,15 +212,69 @@
     async function loadAgentData() {
       if (!selectedAgent) return;
       const hours = $("#hours").value;
-      const [summaryR, windowsR] = await Promise.all([
+      const [summaryR, windowsR, meetingsR] = await Promise.all([
         fetch(`/agents/${selectedAgent}/summary?hours=${hours}`),
         fetch(`/agents/${selectedAgent}/windows?limit=50`),
+        fetch(`/meetings?agent_id=${selectedAgent}&limit=20`),
       ]);
       const summary = await summaryR.json();
       const windows = await windowsR.json();
+      const meetings = await meetingsR.json();
       renderSummary(summary);
       renderWindows(windows);
+      renderMeetings(meetings);
       $("#updated").textContent = "обновлено " + fmtTime(new Date().toISOString());
+    }
+
+    function getToken() {
+      let t = $("#apiToken").value.trim();
+      if (!t) t = localStorage.getItem("omToken") || "";
+      if (t) localStorage.setItem("omToken", t);
+      return t;
+    }
+
+    async function startMeeting(agentId) {
+      const token = getToken();
+      if (!token) { alert("вставь API-токен в поле слева"); return; }
+      const client = prompt("Имя клиента (опционально):", "Тест-клиент") ?? "";
+      const r = await fetch("/meeting/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+        body: JSON.stringify({ agent_id: agentId, client_name: client || null }),
+      });
+      if (!r.ok) { alert("Ошибка: " + r.status + " " + await r.text()); return; }
+      loadAgents(); loadAgentData();
+    }
+
+    async function stopMeeting(agentId) {
+      const token = getToken();
+      if (!token) { alert("вставь API-токен в поле слева"); return; }
+      const r = await fetch("/meeting/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+        body: JSON.stringify({ agent_id: agentId }),
+      });
+      if (!r.ok) { alert("Ошибка: " + r.status + " " + await r.text()); return; }
+      loadAgents(); loadAgentData();
+    }
+
+    function renderMeetings(meetings) {
+      const el = $("#meetings");
+      if (!meetings.length) {
+        el.innerHTML = '<div class="empty">встреч пока нет</div>';
+        return;
+      }
+      el.innerHTML = `<table>
+        <thead><tr><th>Начало</th><th>Конец</th><th>Длительность</th><th>Клиент</th><th>ID</th></tr></thead>
+        <tbody>${meetings.map(m => `
+          <tr>
+            <td>${fmtTime(m.started_at)}</td>
+            <td>${m.ended_at ? fmtTime(m.ended_at) : '<span class="badge meeting">🔴 идёт</span>'}</td>
+            <td class="num">${m.duration_seconds != null ? fmtSec(m.duration_seconds) : '—'}</td>
+            <td>${escapeHTML(m.client_name || '—')}</td>
+            <td class="muted">${m.meeting_id}</td>
+          </tr>`).join("")}</tbody>
+      </table>`;
     }
 
     function renderSummary(summary) {
@@ -213,6 +322,13 @@
 
     $("#refresh").addEventListener("click", () => { loadAgents(); loadAgentData(); });
     $("#hours").addEventListener("change", loadAgentData);
+
+    // восстанавливаем сохранённый токен
+    const savedToken = localStorage.getItem("omToken");
+    if (savedToken) $("#apiToken").value = savedToken;
+    $("#apiToken").addEventListener("change", () => {
+      localStorage.setItem("omToken", $("#apiToken").value.trim());
+    });
 
     loadAgents();
     setInterval(() => { loadAgents(); loadAgentData(); }, 30000);

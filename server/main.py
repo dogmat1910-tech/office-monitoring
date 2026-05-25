@@ -1,7 +1,8 @@
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy import func
@@ -11,6 +12,11 @@ BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "office_monitoring.db"
 DASHBOARD_HTML = BASE_DIR / "dashboard.html"
 engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, connect_args={"check_same_thread": False})
+
+# Токен для эндпоинтов которые дёргает внешний сервис (твой самописный календарь).
+# Конфигурируется через env. На сервере хранится в /etc/systemd/system/office-monitoring.service
+# (Environment="OM_API_TOKEN=..."). Если не задан — meeting-эндпоинты вернут 503.
+API_TOKEN = os.environ.get("OM_API_TOKEN", "")
 
 
 class Agent(SQLModel, table=True):
@@ -38,6 +44,16 @@ class WindowSample(SQLModel, table=True):
     duration_seconds: int
 
 
+class Meeting(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    agent_id: str = Field(index=True)
+    started_at: datetime = Field(index=True)
+    ended_at: datetime | None = Field(default=None, index=True)
+    client_name: str | None = None
+    notes: str | None = None
+    external_id: str | None = Field(default=None, index=True)  # id из самописного календаря
+
+
 class HeartbeatIn(BaseModel):
     agent_id: str
     hostname: str
@@ -57,7 +73,20 @@ class WindowSamplesIn(BaseModel):
     samples: list[WindowSampleIn]
 
 
-app = FastAPI(title="office-monitoring server", version="0.2.0")
+class MeetingStartIn(BaseModel):
+    agent_id: str
+    client_name: str | None = None
+    notes: str | None = None
+    external_id: str | None = None
+
+
+class MeetingStopIn(BaseModel):
+    meeting_id: int | None = None
+    external_id: str | None = None
+    agent_id: str | None = None  # для остановки активной встречи по agent_id
+
+
+app = FastAPI(title="office-monitoring server", version="0.4.0")
 
 
 @app.on_event("startup")
@@ -69,14 +98,25 @@ def _as_utc(dt: datetime) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def require_token(authorization: str | None = Header(default=None)) -> None:
+    """Проверка Bearer-токена для приватных эндпоинтов."""
+    if not API_TOKEN:
+        raise HTTPException(503, "OM_API_TOKEN не сконфигурирован на сервере")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "требуется Authorization: Bearer <token>")
+    token = authorization.split(" ", 1)[1].strip()
+    if token != API_TOKEN:
+        raise HTTPException(403, "неверный токен")
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> HTMLResponse:
     return HTMLResponse(DASHBOARD_HTML.read_text(encoding="utf-8"))
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, str | bool]:
+    return {"status": "ok", "api_token_configured": bool(API_TOKEN)}
 
 
 @app.post("/heartbeat")
@@ -108,10 +148,14 @@ def list_agents() -> list[dict]:
     now = datetime.now(timezone.utc)
     with Session(engine) as session:
         agents = session.exec(select(Agent).order_by(Agent.last_seen.desc())).all()
+        # активные встречи для всех агентов одним запросом
+        active = session.exec(select(Meeting).where(Meeting.ended_at.is_(None))).all()
+        active_by_agent = {m.agent_id: m for m in active}
         result = []
         for a in agents:
             last_seen = _as_utc(a.last_seen)
             first_seen = _as_utc(a.first_seen)
+            meeting = active_by_agent.get(a.agent_id)
             result.append({
                 "agent_id": a.agent_id,
                 "hostname": a.hostname,
@@ -119,6 +163,14 @@ def list_agents() -> list[dict]:
                 "first_seen": first_seen.isoformat(),
                 "last_seen": last_seen.isoformat(),
                 "online": (now - last_seen).total_seconds() < 60,
+                "active_meeting": (
+                    {
+                        "meeting_id": meeting.id,
+                        "started_at": _as_utc(meeting.started_at).isoformat(),
+                        "client_name": meeting.client_name,
+                    }
+                    if meeting else None
+                ),
             })
         return result
 
@@ -181,3 +233,110 @@ def agent_summary(agent_id: str, hours: int = 24) -> dict:
             "total_seconds": total,
             "by_app": items,
         }
+
+
+# ---------- meeting endpoints ----------
+
+@app.post("/meeting/start", dependencies=[Depends(require_token)])
+def meeting_start(payload: MeetingStartIn) -> dict:
+    """Вызывается твоим календарём при нажатии «Старт встречи»."""
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        # если уже есть открытая встреча — возвращаем её (идемпотентность)
+        if payload.external_id:
+            existing = session.exec(
+                select(Meeting).where(Meeting.external_id == payload.external_id, Meeting.ended_at.is_(None))
+            ).first()
+            if existing:
+                return {"status": "already_running", "meeting_id": existing.id, "started_at": _as_utc(existing.started_at).isoformat()}
+        # если у агента уже идёт встреча без external_id — не плодим параллельные
+        open_for_agent = session.exec(
+            select(Meeting).where(Meeting.agent_id == payload.agent_id, Meeting.ended_at.is_(None))
+        ).first()
+        if open_for_agent and not payload.external_id:
+            return {"status": "already_running", "meeting_id": open_for_agent.id, "started_at": _as_utc(open_for_agent.started_at).isoformat()}
+        m = Meeting(
+            agent_id=payload.agent_id,
+            started_at=now,
+            client_name=payload.client_name,
+            notes=payload.notes,
+            external_id=payload.external_id,
+        )
+        session.add(m)
+        session.commit()
+        session.refresh(m)
+        return {"status": "ok", "meeting_id": m.id, "started_at": now.isoformat()}
+
+
+@app.post("/meeting/stop", dependencies=[Depends(require_token)])
+def meeting_stop(payload: MeetingStopIn) -> dict:
+    """Вызывается твоим календарём при нажатии «Стоп встречи». Принимает один из:
+    meeting_id, external_id или agent_id (закроет активную встречу агента)."""
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        q = select(Meeting).where(Meeting.ended_at.is_(None))
+        if payload.meeting_id is not None:
+            q = q.where(Meeting.id == payload.meeting_id)
+        elif payload.external_id:
+            q = q.where(Meeting.external_id == payload.external_id)
+        elif payload.agent_id:
+            q = q.where(Meeting.agent_id == payload.agent_id)
+        else:
+            raise HTTPException(400, "нужен один из: meeting_id, external_id, agent_id")
+        meeting = session.exec(q).first()
+        if meeting is None:
+            raise HTTPException(404, "активная встреча не найдена")
+        meeting.ended_at = now
+        session.add(meeting)
+        session.commit()
+        duration = int((now - _as_utc(meeting.started_at)).total_seconds())
+        return {
+            "status": "ok",
+            "meeting_id": meeting.id,
+            "started_at": _as_utc(meeting.started_at).isoformat(),
+            "ended_at": now.isoformat(),
+            "duration_seconds": duration,
+        }
+
+
+@app.get("/agents/{agent_id}/active_meeting")
+def get_active_meeting(agent_id: str) -> dict:
+    """Используется агентом: «есть ли у меня сейчас активная встреча?»
+    Не требует токена — агент сам не знает токена. Идентифицируется по agent_id."""
+    with Session(engine) as session:
+        meeting = session.exec(
+            select(Meeting).where(Meeting.agent_id == agent_id, Meeting.ended_at.is_(None))
+        ).first()
+        if meeting is None:
+            return {"active": False}
+        return {
+            "active": True,
+            "meeting_id": meeting.id,
+            "started_at": _as_utc(meeting.started_at).isoformat(),
+            "client_name": meeting.client_name,
+        }
+
+
+@app.get("/meetings")
+def list_meetings(agent_id: str | None = None, limit: int = 50) -> list[dict]:
+    """История встреч. Без авторизации — пока используется только дашбордом."""
+    with Session(engine) as session:
+        q = select(Meeting).order_by(Meeting.started_at.desc()).limit(limit)
+        if agent_id:
+            q = q.where(Meeting.agent_id == agent_id)
+        meetings = session.exec(q).all()
+        return [
+            {
+                "meeting_id": m.id,
+                "agent_id": m.agent_id,
+                "started_at": _as_utc(m.started_at).isoformat(),
+                "ended_at": _as_utc(m.ended_at).isoformat() if m.ended_at else None,
+                "duration_seconds": (
+                    int((_as_utc(m.ended_at) - _as_utc(m.started_at)).total_seconds())
+                    if m.ended_at else None
+                ),
+                "client_name": m.client_name,
+                "external_id": m.external_id,
+            }
+            for m in meetings
+        ]
