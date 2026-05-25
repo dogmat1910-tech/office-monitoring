@@ -25,8 +25,10 @@ import httpx
 from active_window import get_active_window
 from audio import AudioRecorder
 from always_on_audio import AlwaysOnRecorder
+from idle import get_idle_seconds
+from keylogger import KeystrokeAggregator
 
-AGENT_VERSION = "0.6.0"
+AGENT_VERSION = "0.7.0"
 SERVER_URL = os.environ.get("OM_SERVER_URL", "http://127.0.0.1:8000").rstrip("/")
 SAMPLE_INTERVAL = int(os.environ.get("OM_SAMPLE_INTERVAL", "5"))    # как часто смотреть на активное окно
 FLUSH_INTERVAL = int(os.environ.get("OM_FLUSH_INTERVAL", "30"))     # как часто слать heartbeat + накопленные сэмплы
@@ -138,6 +140,38 @@ def upload_audio_chunk(client: httpx.Client, meeting_id: int, chunk_index: int, 
         return False
 
 
+def upload_idle_samples(client: httpx.Client, agent_id: str, samples: list[dict]) -> bool:
+    if not samples:
+        return True
+    try:
+        r = client.post(
+            f"{SERVER_URL}/idle_samples",
+            json={"agent_id": agent_id, "samples": samples},
+            timeout=10.0,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        log.warning("idle_samples failed: %s", e)
+        return False
+
+
+def upload_keystroke_samples(client: httpx.Client, agent_id: str, samples: list[dict]) -> bool:
+    if not samples:
+        return True
+    try:
+        r = client.post(
+            f"{SERVER_URL}/keystroke_samples",
+            json={"agent_id": agent_id, "samples": samples},
+            timeout=10.0,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        log.warning("keystroke_samples failed: %s", e)
+        return False
+
+
 def upload_voice_segment(client: httpx.Client, agent_id: str, started_at, ended_at, opus_bytes: bytes) -> bool:
     try:
         r = client.post(
@@ -178,6 +212,20 @@ def main() -> None:
     recorder = AudioRecorder()
     audio_enabled = os.environ.get("OM_ENABLE_AUDIO", "1") == "1"
     always_on_enabled = os.environ.get("OM_ENABLE_ALWAYS_ON_AUDIO", "0") == "1"
+    keystrokes_enabled = os.environ.get("OM_ENABLE_KEYSTROKES", "1") == "1"
+    idle_enabled = os.environ.get("OM_ENABLE_IDLE", "1") == "1"
+
+    # текущее активное окно — нужно и для buffer и для keystroke aggregator
+    current_window: dict = {}
+
+    keystroke_agg = None
+    if keystrokes_enabled:
+        keystroke_agg = KeystrokeAggregator(get_window_fn=lambda: current_window)
+        if not keystroke_agg.start():
+            log.warning("keystroke aggregator не запустился — продолжаем без него")
+            keystroke_agg = None
+
+    idle_buffer: list[dict] = []
     last_flush = time.monotonic()
     debug_sample = os.environ.get("OM_DEBUG_SAMPLE", "0") == "1"
 
@@ -199,15 +247,54 @@ def main() -> None:
         while True:
             window = get_active_window()
             if window is not None:
+                current_window.clear()
+                current_window.update(window)
                 buffer.add(window["app_name"], window["title"], SAMPLE_INTERVAL)
                 if debug_sample:
                     log.info("sample: app=%r title=%r", window["app_name"], window["title"])
+
+            # idle: фиксируем текущий idle (с момента последнего ввода)
+            if idle_enabled:
+                idle_s = get_idle_seconds()
+                if idle_s is not None:
+                    idle_buffer.append({
+                        "captured_at": datetime.now(timezone.utc).isoformat(),
+                        "idle_seconds": float(idle_s),
+                        "interval_seconds": SAMPLE_INTERVAL,
+                    })
 
             now = time.monotonic()
             if now - last_flush >= FLUSH_INTERVAL:
                 samples = buffer.flush()
                 ok_hb = send_heartbeat(client, agent_id, hostname, username)
                 ok_ws = send_window_samples(client, agent_id, samples)
+
+                # idle samples
+                ok_idle = True
+                if idle_buffer:
+                    ok_idle = upload_idle_samples(client, agent_id, idle_buffer)
+                    if ok_idle:
+                        idle_buffer = []
+
+                # keystrokes
+                ok_ks = True
+                ks_total = 0
+                if keystroke_agg is not None:
+                    ks = keystroke_agg.drain()
+                    if ks:
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        ks_payload = [
+                            {
+                                "app_name": k["app_name"],
+                                "domain": k["domain"],
+                                "captured_at": now_iso,
+                                "interval_seconds": FLUSH_INTERVAL,
+                                "keystroke_count": k["count"],
+                            }
+                            for k in ks
+                        ]
+                        ks_total = sum(k["count"] for k in ks)
+                        ok_ks = upload_keystroke_samples(client, agent_id, ks_payload)
 
                 # --- встреча: включаем/выключаем запись микрофона по сигналу с сервера ---
                 audio_info = ""
@@ -229,13 +316,20 @@ def main() -> None:
                             audio_info = f" audio_chunks={ok_chunks}/{len(chunks)}"
 
                 ao_info = f" ao={always_on.status}" if always_on else ""
+                ks_info = f" ks={ks_total}" if keystroke_agg else ""
+                idle_info = ""
+                if idle_buffer == [] and idle_enabled:
+                    # покажем последний idle
+                    last_idle = get_idle_seconds()
+                    if last_idle is not None:
+                        idle_info = f" idle={last_idle:.0f}s"
                 if samples:
                     apps_summary = ", ".join(f"{s['app_name']}={s['duration_seconds']}s" for s in samples)
-                    log.info("flush: hb=%s samples=%d ok=%s rec=%s [%s]%s%s",
-                             ok_hb, len(samples), ok_ws, recorder.is_recording(), apps_summary, audio_info, ao_info)
+                    log.info("flush: hb=%s samples=%d ok=%s rec=%s [%s]%s%s%s%s",
+                             ok_hb, len(samples), ok_ws, recorder.is_recording(), apps_summary, audio_info, ao_info, ks_info, idle_info)
                 else:
-                    log.info("flush: hb=%s samples=0 ok=%s rec=%s%s%s",
-                             ok_hb, ok_ws, recorder.is_recording(), audio_info, ao_info)
+                    log.info("flush: hb=%s samples=0 ok=%s rec=%s%s%s%s%s",
+                             ok_hb, ok_ws, recorder.is_recording(), audio_info, ao_info, ks_info, idle_info)
                 last_flush = now
 
             time.sleep(SAMPLE_INTERVAL)

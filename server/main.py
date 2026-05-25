@@ -108,6 +108,28 @@ class DomainCategory(SQLModel, table=True):
     updated_at: datetime
 
 
+class IdleSample(SQLModel, table=True):
+    """Замер idle-времени (как давно нет активности мыши/клавиатуры).
+    Если idle_seconds > порога (обычно 60-120), менеджер «не за компом»."""
+    id: int | None = Field(default=None, primary_key=True)
+    agent_id: str = Field(index=True)
+    captured_at: datetime = Field(index=True)
+    idle_seconds: float
+    interval_seconds: int  # длительность периода с прошлого сэмпла
+
+
+class KeystrokeSample(SQLModel, table=True):
+    """Агрегированная статистика нажатий клавиш по приложению/окну.
+    НЕ хранит содержимое нажатий — только счётчик."""
+    id: int | None = Field(default=None, primary_key=True)
+    agent_id: str = Field(index=True)
+    app_name: str = Field(index=True)
+    domain: str | None = Field(default=None, index=True)
+    captured_at: datetime = Field(index=True)
+    interval_seconds: int  # длительность периода с прошлого батча
+    keystroke_count: int  # сколько нажатий за период
+
+
 class DailyReport(SQLModel, table=True):
     """LLM-разбор дня менеджера: встречи, звонки, прокрастинация, оценка."""
     id: int | None = Field(default=None, primary_key=True)
@@ -164,6 +186,30 @@ class WindowSampleIn(BaseModel):
 class WindowSamplesIn(BaseModel):
     agent_id: str
     samples: list[WindowSampleIn]
+
+
+class IdleSampleIn(BaseModel):
+    captured_at: datetime
+    idle_seconds: float
+    interval_seconds: int
+
+
+class IdleSamplesIn(BaseModel):
+    agent_id: str
+    samples: list[IdleSampleIn]
+
+
+class KeystrokeSampleIn(BaseModel):
+    app_name: str
+    domain: str | None = None
+    captured_at: datetime
+    interval_seconds: int
+    keystroke_count: int
+
+
+class KeystrokeSamplesIn(BaseModel):
+    agent_id: str
+    samples: list[KeystrokeSampleIn]
 
 
 class MeetingStartIn(BaseModel):
@@ -281,6 +327,79 @@ def post_window_samples(payload: WindowSamplesIn) -> dict[str, int | str]:
             ))
         session.commit()
     return {"status": "ok", "count": len(payload.samples)}
+
+
+@app.post("/idle_samples")
+def post_idle_samples(payload: IdleSamplesIn) -> dict:
+    with Session(engine) as session:
+        for s in payload.samples:
+            session.add(IdleSample(
+                agent_id=payload.agent_id,
+                captured_at=_as_utc(s.captured_at),
+                idle_seconds=s.idle_seconds,
+                interval_seconds=s.interval_seconds,
+            ))
+        session.commit()
+    return {"status": "ok", "count": len(payload.samples)}
+
+
+@app.post("/keystroke_samples")
+def post_keystroke_samples(payload: KeystrokeSamplesIn) -> dict:
+    with Session(engine) as session:
+        for s in payload.samples:
+            if s.keystroke_count <= 0:
+                continue
+            session.add(KeystrokeSample(
+                agent_id=payload.agent_id,
+                app_name=s.app_name,
+                domain=s.domain,
+                captured_at=_as_utc(s.captured_at),
+                interval_seconds=s.interval_seconds,
+                keystroke_count=s.keystroke_count,
+            ))
+        session.commit()
+    return {"status": "ok", "count": len(payload.samples)}
+
+
+@app.get("/agents/{agent_id}/activity_summary")
+def agent_activity_summary(agent_id: str, hours: int = 24, idle_threshold: int = 60) -> dict:
+    """Сводка по бездействию и набору символов за период.
+    idle_threshold — порог idle_seconds, выше которого считаем «не за компом»."""
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    with Session(engine) as session:
+        # idle: суммируем interval_seconds где idle_seconds > threshold = «не за компом»
+        idle_rows = session.exec(
+            select(IdleSample)
+            .where(IdleSample.agent_id == agent_id)
+            .where(IdleSample.captured_at >= since)
+        ).all()
+        total_interval = sum(r.interval_seconds for r in idle_rows)
+        idle_interval = sum(r.interval_seconds for r in idle_rows if r.idle_seconds > idle_threshold)
+        active_interval = total_interval - idle_interval
+
+        # клавиатура: агрегация по app
+        ks_rows = session.exec(
+            select(KeystrokeSample.app_name, func.sum(KeystrokeSample.keystroke_count))
+            .where(KeystrokeSample.agent_id == agent_id)
+            .where(KeystrokeSample.captured_at >= since)
+            .group_by(KeystrokeSample.app_name)
+        ).all()
+        ks_by_app = sorted(
+            [{"app_name": app or "unknown", "keystrokes": int(n or 0)} for app, n in ks_rows],
+            key=lambda x: -x["keystrokes"],
+        )
+        ks_total = sum(x["keystrokes"] for x in ks_by_app)
+
+        return {
+            "agent_id": agent_id,
+            "hours": hours,
+            "idle_threshold_seconds": idle_threshold,
+            "total_tracked_seconds": total_interval,
+            "active_seconds": active_interval,
+            "idle_seconds": idle_interval,
+            "keystrokes_total": ks_total,
+            "keystrokes_by_app": ks_by_app[:20],
+        }
 
 
 @app.get("/agents/{agent_id}/windows")

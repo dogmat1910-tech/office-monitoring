@@ -393,12 +393,17 @@
         </div>
       </div>
 
-      <!-- Tab: Сегодня — плитки сводки дня + детальный барчарт -->
+      <!-- Tab: Сегодня — плитки сводки дня + активность + барчарт -->
       <div class="tab-content" data-tab-content="today">
         <div id="dayTiles" class="day-summary"></div>
+        <div id="activityTiles" class="day-summary"></div>
         <div class="panel">
           <h2>Приложения и сайты</h2>
           <div id="appsBars"></div>
+        </div>
+        <div class="panel">
+          <h2>Клавиатурная активность</h2>
+          <div id="keystrokesByApp"></div>
         </div>
       </div>
 
@@ -566,24 +571,55 @@
     async function loadAgentData() {
       if (!selectedAgent) return;
       const hours = $("#hours").value;
-      const [daySummaryR, windowsR, meetingsR, voiceR] = await Promise.all([
+      const [daySummaryR, windowsR, meetingsR, voiceR, activityR] = await Promise.all([
         fetch(`/agents/${selectedAgent}/day_summary?hours=${hours}`),
         fetch(`/agents/${selectedAgent}/windows?limit=50`),
         fetch(`/meetings?agent_id=${selectedAgent}&limit=20`),
         fetch(`/agents/${selectedAgent}/voice_segments?hours=${hours}&limit=100`),
+        fetch(`/agents/${selectedAgent}/activity_summary?hours=${hours}`),
       ]);
       const daySummary = await daySummaryR.json();
       const windows = await windowsR.json();
       const meetings = await meetingsR.json();
       const voice = await voiceR.json();
+      const activity = await activityR.json();
 
       renderDayTiles(daySummary);
+      renderActivityTiles(activity);
+      renderKeystrokes(activity);
       renderMeetingsSummary(daySummary, meetings);
       renderAppsBars(daySummary);
       renderMeetings(meetings);
       renderVoice(voice);
       renderWindows(windows);
       $("#updated").textContent = "обновлено " + fmtTime(new Date().toISOString());
+    }
+
+    function renderActivityTiles(a) {
+      if (!a) { $("#activityTiles").innerHTML = ""; return; }
+      $("#activityTiles").innerHTML = `
+        <div class="day-tile work"><div class="label">за компом</div><div class="value">${fmtSec(a.active_seconds || 0)}</div></div>
+        <div class="day-tile personal"><div class="label">бездействие</div><div class="value">${fmtSec(a.idle_seconds || 0)}</div></div>
+        <div class="day-tile neutral"><div class="label">всего символов</div><div class="value">${a.keystrokes_total || 0}</div></div>
+        <div class="day-tile meeting"><div class="label">приложений с вводом</div><div class="value">${(a.keystrokes_by_app || []).length}</div></div>`;
+    }
+
+    function renderKeystrokes(a) {
+      const el = $("#keystrokesByApp");
+      const arr = (a && a.keystrokes_by_app) || [];
+      if (!arr.length) {
+        el.innerHTML = '<div class="empty">клавиатурной активности за этот период не зафиксировано</div>';
+        return;
+      }
+      const max = arr[0].keystrokes;
+      el.innerHTML = arr.map(item => {
+        const pct = max > 0 ? (item.keystrokes / max * 100).toFixed(1) : 0;
+        return `<div class="bar-row">
+          <div class="name">⌨ ${escapeHTML(item.app_name)}</div>
+          <div class="bar-bg"><div class="bar-fill" style="width:${pct}%"></div></div>
+          <div class="num">${item.keystrokes} знаков</div>
+        </div>`;
+      }).join("");
     }
 
     // ───────────── Шапка «Сегодня»: 4 плитки сводки дня ─────────────
