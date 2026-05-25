@@ -26,26 +26,67 @@ def get_active_window() -> dict | None:
     return None
 
 
+_OSASCRIPT_FRONTMOST = '''
+tell application "System Events"
+    set frontApp to first application process whose frontmost is true
+    set appName to name of frontApp
+    set windowTitle to ""
+    try
+        set windowTitle to name of front window of frontApp
+    end try
+    return appName & "|" & windowTitle
+end tell
+'''
+
+
 def _get_mac() -> dict | None:
+    """
+    На Mac используем osascript: NSWorkspace API в долго живущих Python-процессах
+    без main runloop кеширует frontmostApplication() и возвращает залипшее значение.
+    osascript запускает свежий процесс System Events каждый раз — состояние всегда актуально.
+
+    Заголовок окна требует разрешения Accessibility (System Settings → Privacy →
+    Accessibility → добавить Terminal/iTerm/Python). Если разрешения нет — title пустой,
+    имя приложения всё равно вернётся корректно.
+    """
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", _OSASCRIPT_FRONTMOST],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        if r.returncode != 0:
+            log.debug("osascript failed (rc=%d): %s", r.returncode, r.stderr.strip())
+            return _get_mac_nsworkspace_fallback()
+        out = r.stdout.strip()
+        if "|" in out:
+            app_name, title = out.split("|", 1)
+        else:
+            app_name, title = out, ""
+        if not app_name:
+            return None
+        return {"app_name": app_name, "title": title, "pid": 0}
+    except FileNotFoundError:
+        log.warning("osascript не найден — fallback на NSWorkspace")
+        return _get_mac_nsworkspace_fallback()
+    except subprocess.TimeoutExpired:
+        log.warning("osascript timeout")
+        return None
+    except Exception as e:
+        log.warning("osascript ошибка: %s", e)
+        return _get_mac_nsworkspace_fallback()
+
+
+def _get_mac_nsworkspace_fallback() -> dict | None:
     try:
         from AppKit import NSWorkspace  # type: ignore
     except ImportError:
-        log.warning("AppKit (pyobjc-framework-Cocoa) не установлен — окна не отслеживаются")
         return None
-
     try:
-        ws = NSWorkspace.sharedWorkspace()
-        # runningApplications() + isActive() надёжнее чем frontmostApplication(),
-        # который иногда возвращает закешированное значение в долго живущих процессах.
-        for app in ws.runningApplications():
-            if app.isActive():
-                return {
-                    "app_name": str(app.localizedName() or "unknown"),
-                    "title": "",
-                    "pid": int(app.processIdentifier()),
-                }
-        # fallback на frontmostApplication
-        app = ws.frontmostApplication()
+        app = NSWorkspace.sharedWorkspace().frontmostApplication()
         if app is None:
             return None
         return {
@@ -53,8 +94,7 @@ def _get_mac() -> dict | None:
             "title": "",
             "pid": int(app.processIdentifier()),
         }
-    except Exception as e:
-        log.warning("get_active_window mac failed: %s", e)
+    except Exception:
         return None
 
 
