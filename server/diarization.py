@@ -109,13 +109,24 @@ def diarize_audio_file(wav_path: Path, num_speakers: int | None = None) -> list[
 
     t0 = time.monotonic()
     try:
-        diarization = pipe(str(wav_path), **kwargs)
+        output = pipe(str(wav_path), **kwargs)
     except Exception as e:
         log.exception("diarization упала: %s", e)
         return []
 
+    # pyannote 4.x возвращает DiarizeOutput с полями speaker_diarization
+    # (с overlap) и exclusive_speaker_diarization (без overlap). Берём первый.
+    if hasattr(output, "speaker_diarization"):
+        annotation = output.speaker_diarization
+    elif hasattr(output, "itertracks"):
+        # старый API (Annotation напрямую) — оставлено как fallback
+        annotation = output
+    else:
+        log.warning("неизвестный тип возврата pyannote: %r", type(output))
+        return []
+
     result = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
+    for turn, _, speaker in annotation.itertracks(yield_label=True):
         result.append({
             "speaker": str(speaker),
             "start": float(turn.start),
