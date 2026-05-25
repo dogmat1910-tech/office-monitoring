@@ -24,8 +24,9 @@ import httpx
 
 from active_window import get_active_window
 from audio import AudioRecorder
+from always_on_audio import AlwaysOnRecorder
 
-AGENT_VERSION = "0.5.0"
+AGENT_VERSION = "0.6.0"
 SERVER_URL = os.environ.get("OM_SERVER_URL", "http://127.0.0.1:8000").rstrip("/")
 SAMPLE_INTERVAL = int(os.environ.get("OM_SAMPLE_INTERVAL", "5"))    # как часто смотреть на активное окно
 FLUSH_INTERVAL = int(os.environ.get("OM_FLUSH_INTERVAL", "30"))     # как часто слать heartbeat + накопленные сэмплы
@@ -137,6 +138,25 @@ def upload_audio_chunk(client: httpx.Client, meeting_id: int, chunk_index: int, 
         return False
 
 
+def upload_voice_segment(client: httpx.Client, agent_id: str, started_at, ended_at, opus_bytes: bytes) -> bool:
+    try:
+        r = client.post(
+            f"{SERVER_URL}/voice_segments",
+            data={
+                "agent_id": agent_id,
+                "started_at": started_at.isoformat(),
+                "ended_at": ended_at.isoformat(),
+            },
+            files={"file": (f"seg.opus", opus_bytes, "audio/ogg")},
+            timeout=60.0,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        log.warning("upload voice segment failed: %s", e)
+        return False
+
+
 def main() -> None:
     hostname = socket.gethostname()
     username = getpass.getuser()
@@ -157,6 +177,7 @@ def main() -> None:
     buffer = WindowBuffer()
     recorder = AudioRecorder()
     audio_enabled = os.environ.get("OM_ENABLE_AUDIO", "1") == "1"
+    always_on_enabled = os.environ.get("OM_ENABLE_ALWAYS_ON_AUDIO", "0") == "1"
     last_flush = time.monotonic()
     debug_sample = os.environ.get("OM_DEBUG_SAMPLE", "0") == "1"
 
@@ -164,6 +185,17 @@ def main() -> None:
     # Корпоративные ноутбуки иногда сидят за SOCKS-VPN (Outline/Shadowsocks), который
     # ломает httpx без отдельной либы. Наш агент ходит на свой сервер напрямую.
     with httpx.Client(trust_env=False) as client:
+
+        # Always-on рекордер: пишет голосовые сегменты весь рабочий день.
+        # Включается через OM_ENABLE_ALWAYS_ON_AUDIO=1.
+        always_on = None
+        if always_on_enabled:
+            def _send_voice(started, ended, opus_bytes):
+                upload_voice_segment(client, agent_id, started, ended, opus_bytes)
+            always_on = AlwaysOnRecorder(send_callback=_send_voice)
+            if not always_on.start():
+                log.warning("always-on не запустился — продолжаем без него")
+                always_on = None
         while True:
             window = get_active_window()
             if window is not None:
@@ -196,13 +228,14 @@ def main() -> None:
                             )
                             audio_info = f" audio_chunks={ok_chunks}/{len(chunks)}"
 
+                ao_info = f" ao={always_on.status}" if always_on else ""
                 if samples:
                     apps_summary = ", ".join(f"{s['app_name']}={s['duration_seconds']}s" for s in samples)
-                    log.info("flush: hb=%s samples=%d ok=%s rec=%s [%s]%s",
-                             ok_hb, len(samples), ok_ws, recorder.is_recording(), apps_summary, audio_info)
+                    log.info("flush: hb=%s samples=%d ok=%s rec=%s [%s]%s%s",
+                             ok_hb, len(samples), ok_ws, recorder.is_recording(), apps_summary, audio_info, ao_info)
                 else:
-                    log.info("flush: hb=%s samples=0 ok=%s rec=%s%s",
-                             ok_hb, ok_ws, recorder.is_recording(), audio_info)
+                    log.info("flush: hb=%s samples=0 ok=%s rec=%s%s%s",
+                             ok_hb, ok_ws, recorder.is_recording(), audio_info, ao_info)
                 last_flush = now
 
             time.sleep(SAMPLE_INTERVAL)
