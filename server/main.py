@@ -13,6 +13,8 @@ DB_PATH = BASE_DIR / "office_monitoring.db"
 DASHBOARD_HTML = BASE_DIR / "dashboard.html"
 AUDIO_DIR = BASE_DIR / "audio_data"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+VOICE_DIR = BASE_DIR / "voice_data"
+VOICE_DIR.mkdir(parents=True, exist_ok=True)
 engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, connect_args={"check_same_thread": False})
 
 # Токен для эндпоинтов которые дёргает внешний сервис (твой самописный календарь).
@@ -93,6 +95,27 @@ class AppCategory(SQLModel, table=True):
     app_name: str = Field(index=True, unique=True)
     category: str  # work | personal | neutral
     updated_at: datetime
+
+
+class VoiceSegment(SQLModel, table=True):
+    """Сегмент непрерывной речи, найденный VAD-фильтром в always-on записи.
+    Привязка к встрече делается ретроактивно в воркере по started_at."""
+    id: int | None = Field(default=None, primary_key=True)
+    agent_id: str = Field(index=True)
+    started_at: datetime = Field(index=True)
+    ended_at: datetime
+    duration_seconds: float
+    file_path: str  # относительно VOICE_DIR
+    format: str = "opus"
+    size_bytes: int
+    received_at: datetime
+    # после транскрипции:
+    text: str | None = None
+    language: str | None = None
+    transcribed_at: datetime | None = None
+    # классификация (заполняется LLM на этапе 13):
+    kind: str | None = Field(default=None, index=True)  # meeting | phone_work | phone_personal | other_speech
+    meeting_id: int | None = Field(default=None, index=True)
 
 
 class HeartbeatIn(BaseModel):
@@ -492,6 +515,88 @@ def agent_day_summary(agent_id: str, hours: int = 24) -> dict:
             ],
             "meetings_count": len(meetings),
         }
+
+
+# ---------- voice segments (always-on аудио) ----------
+
+@app.post("/voice_segments")
+async def upload_voice_segment(
+    agent_id: str = Form(...),
+    started_at: str = Form(...),  # ISO datetime
+    ended_at: str = Form(...),
+    file: UploadFile = File(...),
+) -> dict:
+    """Always-on рекордер шлёт сегменты речи (отфильтрованные VAD'ом)."""
+    contents = await file.read()
+    try:
+        t_start = datetime.fromisoformat(started_at)
+        t_end = datetime.fromisoformat(ended_at)
+    except ValueError as e:
+        raise HTTPException(400, f"некорректный datetime: {e}")
+    t_start = _as_utc(t_start)
+    t_end = _as_utc(t_end)
+    duration = (t_end - t_start).total_seconds()
+
+    # путь: voice_data/{agent_id}/{YYYY-MM-DD}/{HH}/{segment_TS}.opus
+    rel_dir = Path(agent_id) / t_start.strftime("%Y-%m-%d") / t_start.strftime("%H")
+    abs_dir = VOICE_DIR / rel_dir
+    abs_dir.mkdir(parents=True, exist_ok=True)
+    fname = f"seg_{int(t_start.timestamp() * 1000)}.opus"
+    abs_path = abs_dir / fname
+    abs_path.write_bytes(contents)
+    rel_path = str(rel_dir / fname)
+
+    with Session(engine) as session:
+        seg = VoiceSegment(
+            agent_id=agent_id,
+            started_at=t_start,
+            ended_at=t_end,
+            duration_seconds=duration,
+            file_path=rel_path,
+            format="opus",
+            size_bytes=len(contents),
+            received_at=datetime.now(timezone.utc),
+        )
+        session.add(seg)
+        session.commit()
+        session.refresh(seg)
+        return {"status": "ok", "segment_id": seg.id, "size_bytes": len(contents), "duration_seconds": duration}
+
+
+@app.get("/agents/{agent_id}/voice_segments")
+def list_voice_segments(
+    agent_id: str,
+    hours: int = 8,
+    limit: int = 200,
+    transcribed_only: bool = False,
+) -> list[dict]:
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    with Session(engine) as session:
+        q = (
+            select(VoiceSegment)
+            .where(VoiceSegment.agent_id == agent_id)
+            .where(VoiceSegment.started_at >= since)
+            .order_by(VoiceSegment.started_at.desc())
+            .limit(limit)
+        )
+        if transcribed_only:
+            q = q.where(VoiceSegment.text.is_not(None))
+        segs = session.exec(q).all()
+        return [
+            {
+                "segment_id": s.id,
+                "started_at": _as_utc(s.started_at).isoformat(),
+                "ended_at": _as_utc(s.ended_at).isoformat(),
+                "duration_seconds": s.duration_seconds,
+                "size_bytes": s.size_bytes,
+                "transcribed": s.text is not None,
+                "text": s.text,
+                "language": s.language,
+                "kind": s.kind,
+                "meeting_id": s.meeting_id,
+            }
+            for s in segs
+        ]
 
 
 @app.post("/meetings/{meeting_id}/audio")
