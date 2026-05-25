@@ -668,8 +668,9 @@
       </div>`;
       el.innerHTML = head + segs.map(s => {
         const kindHtml = s.kind ? `<span class="kind ${s.kind}">${kindLabel(s.kind)}</span>` : '';
+        const summaryHtml = s.kind_summary ? `<div class="muted" style="font-size:11px;margin-top:2px;">▸ ${escapeHTML(s.kind_summary)}</div>` : '';
         const text = s.transcribed
-          ? `<div class="text">${kindHtml}${escapeHTML(s.text || "(пусто)")}</div>`
+          ? `<div class="text">${kindHtml}${escapeHTML(s.text || "(пусто)")}${summaryHtml}</div>`
           : `<div class="text pending">${kindHtml}⏳ ждёт транскрипции...</div>`;
         return `<div class="voice-seg">
           <div class="ts">${fmtTime(s.started_at)}</div>
@@ -679,7 +680,14 @@
       }).join("");
     }
     function kindLabel(k) {
-      return ({ meeting: "встреча", phone_work: "тел.раб.", phone_personal: "тел.личн.", other_speech: "разговор" })[k] || k;
+      return ({
+        meeting: "встреча",
+        phone_work: "тел.раб.",
+        phone_personal: "тел.личн.",
+        office_chat: "офис",
+        other_speech: "разговор",
+        noise: "шум",
+      })[k] || k;
     }
 
     // ───────────── Tab: Окна ─────────────

@@ -124,8 +124,7 @@ class DailyReport(SQLModel, table=True):
 
 
 class VoiceSegment(SQLModel, table=True):
-    """Сегмент непрерывной речи, найденный VAD-фильтром в always-on записи.
-    Привязка к встрече делается ретроактивно в воркере по started_at."""
+    """Сегмент непрерывной речи, найденный VAD-фильтром в always-on записи."""
     id: int | None = Field(default=None, primary_key=True)
     agent_id: str = Field(index=True)
     started_at: datetime = Field(index=True)
@@ -139,8 +138,12 @@ class VoiceSegment(SQLModel, table=True):
     text: str | None = None
     language: str | None = None
     transcribed_at: datetime | None = None
-    # классификация (заполняется LLM на этапе 13):
-    kind: str | None = Field(default=None, index=True)  # meeting | phone_work | phone_personal | other_speech
+    # классификация LLM-ом (этап 13):
+    # meeting | phone_work | phone_personal | office_chat | other_speech | noise
+    kind: str | None = Field(default=None, index=True)
+    kind_summary: str | None = None
+    kind_confidence: float | None = None
+    classified_at: datetime | None = None
     meeting_id: int | None = Field(default=None, index=True)
 
 
@@ -814,6 +817,8 @@ def list_voice_segments(
                 "text": s.text,
                 "language": s.language,
                 "kind": s.kind,
+                "kind_summary": s.kind_summary,
+                "kind_confidence": s.kind_confidence,
                 "meeting_id": s.meeting_id,
             }
             for s in segs

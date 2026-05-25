@@ -21,6 +21,7 @@ from sqlmodel import Session, select
 # импорт моделей и engine из main.py
 from main import AUDIO_DIR, VOICE_DIR, Analysis, AudioChunk, DailyReport, Meeting, Transcript, VoiceSegment, engine
 from analyze import analyze_transcript
+from classify_voice import auto_bind_meeting_id, classify_voice_segment
 from daily_report import generate_daily_report
 from transcribe import get_model, transcribe_meeting, transcribe_voice_segment
 
@@ -69,6 +70,68 @@ def find_pending_voice_segment() -> int | None:
             .order_by(VoiceSegment.started_at)
         ).first()
         return seg.id if seg else None
+
+
+def find_pending_voice_classification() -> int | None:
+    """VoiceSegment транскрибированный, но ещё не классифицированный.
+    Игнорируем пустые транскрипты и явные ошибки."""
+    with Session(engine) as session:
+        seg = session.exec(
+            select(VoiceSegment)
+            .where(VoiceSegment.text.is_not(None))
+            .where(VoiceSegment.kind.is_(None))
+            .where(VoiceSegment.text != "")
+            .order_by(VoiceSegment.started_at)
+        ).first()
+        return seg.id if seg else None
+
+
+def process_voice_classification(segment_id: int) -> None:
+    """LLM классифицирует kind + summary, плюс auto-bind к встрече по времени."""
+    with Session(engine) as session:
+        seg = session.exec(select(VoiceSegment).where(VoiceSegment.id == segment_id)).first()
+        if seg is None:
+            return
+        # пропускаем явные ошибки транскрипции / служебные тексты
+        if seg.text and (seg.text.startswith("[ошибка") or seg.text.startswith("[файл")):
+            seg.kind = "noise"
+            seg.kind_summary = "не классифицировано (ошибка транскрипции)"
+            seg.classified_at = datetime.now(timezone.utc)
+            session.add(seg)
+            session.commit()
+            return
+    # auto-bind к встрече (бесплатно, не LLM)
+    bound_meeting = auto_bind_meeting_id(segment_id)
+
+    try:
+        log.info("voice_segment %d: классификация", segment_id)
+        result = classify_voice_segment(segment_id)
+        with Session(engine) as session:
+            seg = session.exec(select(VoiceSegment).where(VoiceSegment.id == segment_id)).first()
+            if seg is None:
+                return
+            seg.kind = result.get("kind")
+            seg.kind_summary = result.get("summary")
+            seg.kind_confidence = result.get("confidence")
+            seg.classified_at = datetime.now(timezone.utc)
+            if bound_meeting is not None:
+                seg.meeting_id = bound_meeting
+            session.add(seg)
+            session.commit()
+        log.info("voice_segment %d: kind=%s confidence=%s meeting_id=%s",
+                 segment_id, result.get("kind"), result.get("confidence"), bound_meeting)
+    except Exception as e:
+        log.exception("voice_segment %d: ошибка классификации: %s", segment_id, e)
+        with Session(engine) as session:
+            seg = session.exec(select(VoiceSegment).where(VoiceSegment.id == segment_id)).first()
+            if seg:
+                seg.kind = "other_speech"
+                seg.kind_summary = f"[ошибка классификации: {e}]"[:200]
+                seg.classified_at = datetime.now(timezone.utc)
+                if bound_meeting is not None:
+                    seg.meeting_id = bound_meeting
+                session.add(seg)
+                session.commit()
 
 
 def find_pending_daily_report() -> int | None:
@@ -217,6 +280,12 @@ def process_one() -> bool:
     seg_id = find_pending_voice_segment()
     if seg_id is not None:
         process_voice_segment(seg_id)
+        return True
+
+    # Этап 2.5: классификация транскрибированных, но ещё не классифицированных сегментов
+    seg_id = find_pending_voice_classification()
+    if seg_id is not None:
+        process_voice_classification(seg_id)
         return True
 
     # Этап 3: pending daily reports
