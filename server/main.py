@@ -69,18 +69,25 @@ def heartbeat(payload: HeartbeatIn) -> dict[str, str]:
     return {"status": "ok", "server_time": now.isoformat()}
 
 
+def _as_utc(dt: datetime) -> datetime:
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 @app.get("/agents")
 def list_agents() -> list[dict]:
+    now = datetime.now(timezone.utc)
     with Session(engine) as session:
         agents = session.exec(select(Agent).order_by(Agent.last_seen.desc())).all()
-        return [
-            {
+        result = []
+        for a in agents:
+            last_seen = _as_utc(a.last_seen)
+            first_seen = _as_utc(a.first_seen)
+            result.append({
                 "agent_id": a.agent_id,
                 "hostname": a.hostname,
                 "username": a.username,
-                "first_seen": a.first_seen.isoformat(),
-                "last_seen": a.last_seen.isoformat(),
-                "online": (datetime.now(timezone.utc) - a.last_seen).total_seconds() < 60,
-            }
-            for a in agents
-        ]
+                "first_seen": first_seen.isoformat(),
+                "last_seen": last_seen.isoformat(),
+                "online": (now - last_seen).total_seconds() < 60,
+            })
+        return result
