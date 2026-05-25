@@ -130,19 +130,26 @@ def main() -> None:
 
     buffer = WindowBuffer()
     last_flush = time.monotonic()
+    debug_sample = os.environ.get("OM_DEBUG_SAMPLE", "0") == "1"
 
     with httpx.Client() as client:
         while True:
             window = get_active_window()
             if window is not None:
                 buffer.add(window["app_name"], window["title"], SAMPLE_INTERVAL)
+                if debug_sample:
+                    log.info("sample: app=%r title=%r", window["app_name"], window["title"])
 
             now = time.monotonic()
             if now - last_flush >= FLUSH_INTERVAL:
                 samples = buffer.flush()
                 ok_hb = send_heartbeat(client, agent_id, hostname, username)
                 ok_ws = send_window_samples(client, agent_id, samples)
-                log.info("flush: heartbeat=%s window_samples=%d ok=%s", ok_hb, len(samples), ok_ws)
+                if samples:
+                    apps_summary = ", ".join(f"{s['app_name']}={s['duration_seconds']}s" for s in samples)
+                    log.info("flush: hb=%s samples=%d ok=%s [%s]", ok_hb, len(samples), ok_ws, apps_summary)
+                else:
+                    log.info("flush: hb=%s samples=0 ok=%s", ok_hb, ok_ws)
                 last_flush = now
 
             time.sleep(SAMPLE_INTERVAL)
