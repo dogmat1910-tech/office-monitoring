@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 
 import httpx
@@ -67,7 +68,7 @@ def analyze_transcript(transcript: str) -> dict:
     log.info("analyze: %.1f s, prompt_tokens=%s, completion_tokens=%s",
              elapsed, usage.get("prompt_tokens"), usage.get("completion_tokens"))
 
-    parsed = json.loads(content)
+    parsed = _extract_json(content)
     parsed["_meta"] = {
         "model": MODEL,
         "processing_time_seconds": elapsed,
@@ -75,3 +76,50 @@ def analyze_transcript(transcript: str) -> dict:
         "completion_tokens": usage.get("completion_tokens"),
     }
     return parsed
+
+
+def _extract_json(content: str) -> dict:
+    """Достаёт JSON из ответа LLM. Терпим к markdown-обёрткам и преамбулам."""
+    s = content.strip()
+    # 1) чистый JSON
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    # 2) ```json ... ``` или ``` ... ```
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    # 3) первый сбалансированный {...}
+    start = s.find("{")
+    if start >= 0:
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(s)):
+            c = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = s[start:i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+    log.warning("LLM вернул не-JSON, первые 500 символов: %s", s[:500])
+    raise ValueError(f"не удалось распарсить JSON из ответа LLM (len={len(s)})")
