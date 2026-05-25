@@ -466,6 +466,11 @@
     let selectedAgent = null;
     let activeTab = localStorage.getItem("omTab") || "today";
     let expandedMeetingId = null;
+    // Декларации ниже подняты сюда, чтобы applyTab() при инициализации
+    // мог их безопасно использовать (TDZ-safe).
+    let teamData = null;
+    let teamPollTimer = null;
+    let dailyPollTimer = null;
 
     // ───────────── Tabs ─────────────
     function applyTab(name) {
@@ -814,9 +819,6 @@
     }
 
     // ───────────── Tab: Команда (overview всех агентов) ─────────────
-    let teamPollTimer = null;
-    let teamData = null;
-
     async function loadTeam() {
       const hours = $("#hours").value;
       try {
@@ -922,8 +924,6 @@
     $("#teamOnlyOnline").addEventListener("change", renderTeam);
 
     // ───────────── Tab: Daily Report ─────────────
-    let dailyPollTimer = null;
-
     function todayLocal() {
       const d = new Date();
       const y = d.getFullYear();
