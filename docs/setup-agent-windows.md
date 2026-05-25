@@ -48,8 +48,6 @@ cd C:\office-monitoring
 curl.exe -o agent.py https://raw.githubusercontent.com/dogmat1910-tech/office-monitoring/main/agent/agent.py
 ```
 
-> ⚠️ Репозиторий пока **приватный** — эта команда не сработает без токена. Временное решение: попроси Claude (меня) прислать содержимое `agent.py` сюда в чат, скопируй в файл вручную через `notepad agent.py`. На Шаге 8 сделаем нормальный установщик через релизы GitHub.
-
 ---
 
 ## 4. Создать виртуальное окружение и поставить зависимости
