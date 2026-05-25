@@ -38,6 +38,94 @@ tell application "System Events"
 end tell
 '''
 
+# Браузеры, у которых AppleScript умеет отдавать URL + заголовок активной вкладки.
+# Значение — это код AppleScript. {app} подставляется через .format(app=...)
+_BROWSER_TAB_SCRIPTS = {
+    "Google Chrome": (
+        'tell application "Google Chrome"\n'
+        '    if (count of windows) > 0 then\n'
+        '        set t to active tab of front window\n'
+        '        return (URL of t) & "|" & (title of t)\n'
+        '    end if\n'
+        'end tell'
+    ),
+    "Google Chrome Canary": (
+        'tell application "Google Chrome Canary"\n'
+        '    if (count of windows) > 0 then\n'
+        '        set t to active tab of front window\n'
+        '        return (URL of t) & "|" & (title of t)\n'
+        '    end if\n'
+        'end tell'
+    ),
+    "Microsoft Edge": (
+        'tell application "Microsoft Edge"\n'
+        '    if (count of windows) > 0 then\n'
+        '        set t to active tab of front window\n'
+        '        return (URL of t) & "|" & (title of t)\n'
+        '    end if\n'
+        'end tell'
+    ),
+    "Arc": (
+        'tell application "Arc"\n'
+        '    if (count of windows) > 0 then\n'
+        '        set t to active tab of front window\n'
+        '        return (URL of t) & "|" & (title of t)\n'
+        '    end if\n'
+        'end tell'
+    ),
+    "Brave Browser": (
+        'tell application "Brave Browser"\n'
+        '    if (count of windows) > 0 then\n'
+        '        set t to active tab of front window\n'
+        '        return (URL of t) & "|" & (title of t)\n'
+        '    end if\n'
+        'end tell'
+    ),
+    "Safari": (
+        'tell application "Safari"\n'
+        '    if (count of windows) > 0 then\n'
+        '        set t to current tab of front window\n'
+        '        return (URL of t) & "|" & (name of t)\n'
+        '    end if\n'
+        'end tell'
+    ),
+    # Яндекс.Браузер на Mac — тоже Chromium-based, использует тот же протокол
+    "Yandex": (
+        'tell application "Yandex"\n'
+        '    if (count of windows) > 0 then\n'
+        '        set t to active tab of front window\n'
+        '        return (URL of t) & "|" & (title of t)\n'
+        '    end if\n'
+        'end tell'
+    ),
+}
+
+
+def _get_browser_tab(app_name: str) -> tuple[str, str] | None:
+    """Для известных браузеров пытается получить (url, tab_title) активной вкладки.
+    Возвращает None если приложение не браузер или AppleScript упал
+    (например пользователь не дал разрешение Automation для этого браузера)."""
+    script = _BROWSER_TAB_SCRIPTS.get(app_name)
+    if script is None:
+        return None
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=2.0,
+        )
+        if r.returncode != 0:
+            log.debug("browser tab AS failed for %s: %s", app_name, r.stderr.strip())
+            return None
+        out = r.stdout.strip()
+        if not out or "|" not in out:
+            return None
+        url, tab_title = out.split("|", 1)
+        return url.strip(), tab_title.strip()
+    except Exception as e:
+        log.debug("browser tab AS error for %s: %s", app_name, e)
+        return None
+
 
 def _get_mac() -> dict | None:
     """
@@ -68,6 +156,19 @@ def _get_mac() -> dict | None:
             app_name, title = out, ""
         if not app_name:
             return None
+
+        # Для браузеров: пытаемся получить URL+title активной вкладки.
+        # При первом обращении macOS спросит разрешение Automation для каждого
+        # браузера отдельно (Terminal -> Google Chrome). Если откажешь — fallback
+        # на title окна.
+        tab_info = _get_browser_tab(app_name)
+        if tab_info is not None:
+            url, tab_title = tab_info
+            # Сохраняем в title: «<заголовок вкладки> — <url>»
+            # Если оба пусты — оставляем то что вернул front window.
+            if tab_title or url:
+                title = f"{tab_title} — {url}" if tab_title and url else (tab_title or url)
+
         return {"app_name": app_name, "title": title, "pid": 0}
     except FileNotFoundError:
         log.warning("osascript не найден — fallback на NSWorkspace")
