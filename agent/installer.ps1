@@ -1,4 +1,4 @@
-# office-monitoring agent installer for Windows.
+# office-monitoring agent installer for Windows (EXE-based).
 # Запуск (от админа):
 #   irm https://raw.githubusercontent.com/dogmat1910-tech/office-monitoring/main/agent/installer.ps1 -UseBasicParsing | iex
 
@@ -9,13 +9,9 @@ $InstallDir  = "C:\Program Files\office-monitoring"
 $DataDir     = "C:\ProgramData\office-monitoring"
 $TaskAgent   = "OfficeMonitoring"
 $TaskWatch   = "OfficeMonitoringWatchdog"
-$RepoBase    = "https://raw.githubusercontent.com/dogmat1910-tech/office-monitoring/main/agent"
-$Files       = @(
-    "agent.py", "active_window.py", "audio.py", "always_on_audio.py",
-    "categories.py", "diagnostics.py", "idle.py", "keylogger.py",
-    "local_buffer.py", "screenshot.py", "updater.py", "watchdog.py",
-    "requirements.txt"
-)
+$ReleaseBase = "https://github.com/dogmat1910-tech/office-monitoring/releases/latest/download"
+$AgentExe    = "office-monitoring-agent.exe"
+$WatchExe    = "office-monitoring-watchdog.exe"
 
 function Info($m)  { Write-Host "[*] $m" -ForegroundColor Cyan }
 function Ok($m)    { Write-Host "[+] $m" -ForegroundColor Green }
@@ -28,72 +24,42 @@ if (-not $isAdmin) {
     Fail "Запусти PowerShell от имени администратора"
 }
 
-Info "office-monitoring agent installer"
+Info "office-monitoring agent installer (EXE-based)"
 Info "Сервер: $ServerUrl"
 Info "Папка установки: $InstallDir"
-
-# --- Python ---
-function Get-PythonExe {
-    $candidates = @(
-        "C:\Program Files\Python312\python.exe",
-        "C:\Program Files\Python311\python.exe",
-        "C:\Program Files\Python310\python.exe"
-    )
-    foreach ($c in $candidates) {
-        if (Test-Path $c) { return $c }
-    }
-    $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($cmd -and $cmd.Source -notlike "*WindowsApps*") { return $cmd.Source }
-    return $null
-}
-
-$python = Get-PythonExe
-if (-not $python) {
-    Info "Python не найден, ставлю Python 3.12 через winget..."
-    & winget install --id Python.Python.3.12 -e --source winget --silent `
-        --accept-source-agreements --accept-package-agreements --scope machine
-    if ($LASTEXITCODE -ne 0) { Fail "winget install Python завершился ошибкой" }
-    Start-Sleep -Seconds 3
-    $python = Get-PythonExe
-    if (-not $python) { Fail "Python не найден после установки. Перезапусти PowerShell и повтори." }
-}
-Ok "Python: $python"
 
 # --- Папки ---
 Info "Создаю $InstallDir, $DataDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 
-# --- Файлы агента ---
-Info "Скачиваю модули агента..."
-foreach ($f in $Files) {
-    $dest = Join-Path $InstallDir $f
-    Invoke-WebRequest -Uri "$RepoBase/$f" -OutFile $dest -UseBasicParsing
-    Ok "  $f"
+# --- Останавливаем старые задачи и процессы (для апгрейда) ---
+foreach ($t in @($TaskAgent, $TaskWatch)) {
+    if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
+        Info "Останавливаю старую задачу $t"
+        Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
+    }
 }
+Get-Process -Name "office-monitoring-agent","office-monitoring-watchdog" -ErrorAction SilentlyContinue |
+    Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
 
-# --- venv + зависимости ---
-Info "Создаю venv (--without-pip, ensurepip далее — обход прокси)..."
-$venvDir = Join-Path $InstallDir ".venv"
-if (Test-Path $venvDir) { Remove-Item -Recurse -Force $venvDir }
-& $python -m venv $venvDir --without-pip
-if ($LASTEXITCODE -ne 0) { Fail "python -m venv упал" }
+# --- Скачиваем .exe ---
+Info "Скачиваю $AgentExe..."
+$agentPath = Join-Path $InstallDir $AgentExe
+Invoke-WebRequest -Uri "$ReleaseBase/$AgentExe" -OutFile $agentPath -UseBasicParsing
+Unblock-File -Path $agentPath
+$agentSize = [math]::Round((Get-Item $agentPath).Length / 1MB, 1)
+Ok "  $AgentExe ($agentSize MB)"
 
-$venvPython = Join-Path $venvDir "Scripts\python.exe"
-$venvPythonw = Join-Path $venvDir "Scripts\pythonw.exe"
-if (-not (Test-Path $venvPython)) { Fail "$venvPython не создан" }
+Info "Скачиваю $WatchExe..."
+$watchPath = Join-Path $InstallDir $WatchExe
+Invoke-WebRequest -Uri "$ReleaseBase/$WatchExe" -OutFile $watchPath -UseBasicParsing
+Unblock-File -Path $watchPath
+$watchSize = [math]::Round((Get-Item $watchPath).Length / 1MB, 1)
+Ok "  $WatchExe ($watchSize MB)"
 
-Info "ensurepip..."
-& $venvPython -m ensurepip --upgrade
-if ($LASTEXITCODE -ne 0) { Fail "ensurepip упал" }
-
-Info "Ставлю зависимости (--proxy='' обход SOCKS)..."
-& $venvPython -m pip install --proxy "" --upgrade pip
-& $venvPython -m pip install --proxy "" -r (Join-Path $InstallDir "requirements.txt")
-if ($LASTEXITCODE -ne 0) { Fail "pip install упал" }
-Ok "Зависимости установлены"
-
-# --- Wrapper-скрипты ---
+# --- Wrapper-скрипты (для env vars + start без окна) ---
 $runAgentBat = Join-Path $InstallDir "run-agent.cmd"
 @"
 @echo off
@@ -104,7 +70,7 @@ set OM_INSTALL_DIR=$InstallDir
 set OM_DATA_DIR=$DataDir
 set OM_ENABLE_ALWAYS_ON_AUDIO=1
 cd /d "$InstallDir"
-start "" "$venvPythonw" "$InstallDir\agent.py"
+start "" "$agentPath"
 "@ | Set-Content -Path $runAgentBat -Encoding ASCII
 
 $runWatchBat = Join-Path $InstallDir "run-watchdog.cmd"
@@ -114,7 +80,7 @@ setlocal
 set OM_INSTALL_DIR=$InstallDir
 set OM_DATA_DIR=$DataDir
 cd /d "$InstallDir"
-start "" "$venvPythonw" "$InstallDir\watchdog.py"
+start "" "$watchPath"
 "@ | Set-Content -Path $runWatchBat -Encoding ASCII
 
 # --- Scheduled Task: основной агент ---
@@ -132,13 +98,12 @@ Register-ScheduledTask -TaskName $TaskAgent -Action $action -Trigger $trigger `
     -Principal $principal -Settings $settings -Force | Out-Null
 Ok "Scheduled Task '$TaskAgent' создан"
 
-# --- Scheduled Task: watchdog (с триггерами At-LogOn + раз в 15 мин) ---
+# --- Scheduled Task: watchdog (At-LogOn + каждые 15 мин) ---
 Info "Регистрирую Scheduled Task '$TaskWatch'..."
 schtasks.exe /Delete /TN $TaskWatch /F 2>$null | Out-Null
 
 $actionW    = New-ScheduledTaskAction -Execute $runWatchBat
 $triggerW1  = New-ScheduledTaskTrigger -AtLogOn
-# Триггер раз в 15 минут — на случай если убили оба процесса
 $triggerW2  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(15) `
                 -RepetitionInterval (New-TimeSpan -Minutes 15) `
                 -RepetitionDuration (New-TimeSpan -Days 365)
@@ -148,21 +113,18 @@ Ok "Scheduled Task '$TaskWatch' создан"
 
 # --- ACL: только админ может удалить/изменить ---
 Info "Защищаю папку через ACL..."
-# Сбрасываем наследование, даём Admin/SYSTEM полный, Users только Read+Execute
 & icacls.exe $InstallDir /inheritance:r `
     /grant:r "Administrators:(OI)(CI)F" `
     /grant:r "SYSTEM:(OI)(CI)F" `
     /grant:r "Users:(OI)(CI)RX" /T | Out-Null
-# Дополнительно: явный deny Delete/Modify для обычных пользователей
 & icacls.exe $InstallDir /deny "Users:(DE,DC,WDAC,WO)" /T 2>$null | Out-Null
 Ok "ACL обновлён"
 
-# DataDir — лог должен быть доступен на запись от пользователя (он его пишет)
+# DataDir — лог должен быть на запись от пользователя, но без удаления файлов
 & icacls.exe $DataDir /inheritance:r `
     /grant:r "Administrators:(OI)(CI)F" `
     /grant:r "SYSTEM:(OI)(CI)F" `
     /grant:r "Users:(OI)(CI)RX(WD,AD)" /T | Out-Null
-# но удалить файлы — нельзя
 & icacls.exe $DataDir /deny "Users:(DE,DC)" /T 2>$null | Out-Null
 
 # --- Запускаем ---
@@ -186,7 +148,7 @@ Write-Host "Watchdog:  $DataDir\watchdog.log"
 Write-Host ""
 Write-Host "Команды (от админа):"
 Write-Host "  Get-ScheduledTask -TaskName $TaskAgent,$TaskWatch | Get-ScheduledTaskInfo"
-Write-Host "  Get-Content '$DataDir\agent.log' -Tail 20 -Wait"
+Write-Host "  Get-Content '$DataDir\agent.log' -Tail 20 -Wait -Encoding UTF8"
 Write-Host ""
 Write-Host "Деинсталляция:"
-Write-Host "  irm $RepoBase/uninstall.ps1 -UseBasicParsing | iex"
+Write-Host "  irm https://raw.githubusercontent.com/dogmat1910-tech/office-monitoring/main/agent/uninstall.ps1 -UseBasicParsing | iex"
