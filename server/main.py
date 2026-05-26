@@ -1064,18 +1064,33 @@ class CategoryIn(BaseModel):
 def list_app_categories() -> dict:
     with Session(engine) as session:
         app_merged = get_category_map(session)
-        app_user = {r.app_name for r in session.exec(select(AppCategory)).all()}
         domain_merged = get_domain_category_map(session)
-        domain_user = {r.domain for r in session.exec(select(DomainCategory)).all()}
+        app_rows = {r.app_name: r for r in session.exec(select(AppCategory)).all()}
+        domain_rows = {r.domain: r for r in session.exec(select(DomainCategory)).all()}
+
+    def app_meta(k: str, v: str) -> dict:
+        r = app_rows.get(k)
+        return {
+            "name": k,
+            "category": v,
+            "user_defined": k in app_rows,
+            "auto_categorized": bool(r.auto_categorized) if r else False,
+            "confidence": r.confidence if r else None,
+        }
+
+    def domain_meta(k: str, v: str) -> dict:
+        r = domain_rows.get(k)
+        return {
+            "name": k,
+            "category": v,
+            "user_defined": k in domain_rows,
+            "auto_categorized": bool(r.auto_categorized) if r else False,
+            "confidence": r.confidence if r else None,
+        }
+
     return {
-        "apps": [
-            {"name": k, "category": v, "user_defined": k in app_user}
-            for k, v in sorted(app_merged.items())
-        ],
-        "domains": [
-            {"name": k, "category": v, "user_defined": k in domain_user}
-            for k, v in sorted(domain_merged.items())
-        ],
+        "apps": [app_meta(k, v) for k, v in sorted(app_merged.items())],
+        "domains": [domain_meta(k, v) for k, v in sorted(domain_merged.items())],
     }
 
 
@@ -1141,6 +1156,10 @@ def agent_day_summary(agent_id: str, hours: int = 24, date: str | None = None) -
             .where(WindowSample.captured_at < until)
         ).all()
 
+        # для иконки 🤖 — какие категории расставлены LLM, а какие админом
+        app_auto = {r.app_name: bool(r.auto_categorized) for r in session.exec(select(AppCategory)).all()}
+        domain_auto = {r.domain: bool(r.auto_categorized) for r in session.exec(select(DomainCategory)).all()}
+
         by_category: dict[str, int] = {"work": 0, "personal": 0, "neutral": 0}
         by_app: dict[str, dict] = {}
         for app_name, title, secs in samples:
@@ -1152,13 +1171,16 @@ def agent_day_summary(agent_id: str, hours: int = 24, date: str | None = None) -
                 if kind == "domain":
                     # display = "Google Chrome · youtube.com" → target = "youtube.com"
                     target_name = display.split(" · ", 1)[1]
+                    auto = domain_auto.get(target_name, False)
                 else:
                     target_name = display
+                    auto = app_auto.get(target_name, False)
                 by_app[display] = {
                     "seconds": secs,
                     "category": cat,
                     "target_kind": kind,
                     "target_name": target_name,
+                    "auto_categorized": auto,
                 }
             else:
                 by_app[display]["seconds"] += secs

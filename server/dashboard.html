@@ -868,10 +868,13 @@
         d.by_app.map(item => {
           const pct = max > 0 ? (item.seconds / max * 100).toFixed(1) : 0;
           const icon = item.target_kind === 'domain' ? '🌐' : '📦';
+          const autoBadge = item.auto_categorized
+            ? '<span style="opacity:0.6; margin-left:4px; font-size:11px;" title="категорию определил LLM. Поменяй вручную — больше трогать не будет.">🤖</span>'
+            : '';
           return `<div class="bar-row">
             <div class="name" title="${escapeHTML(item.app_name)}">
               <span title="${item.target_kind === 'domain' ? 'веб-домен' : 'приложение'}">${icon}</span>
-              ${escapeHTML(item.app_name)}
+              ${escapeHTML(item.app_name)}${autoBadge}
               <select class="cat-select" data-name="${escapeHTML(item.target_name)}" data-kind="${item.target_kind}">
                 <option value="work" ${item.category === 'work' ? 'selected' : ''}>работа</option>
                 <option value="neutral" ${item.category === 'neutral' ? 'selected' : ''}>нейтр.</option>
