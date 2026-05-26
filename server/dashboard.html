@@ -313,6 +313,57 @@
     .daily-recommendations { background: var(--panel); border-radius: 8px; padding: 14px 16px; }
     .daily-recommendations h3 { margin: 0 0 6px; text-transform: none; letter-spacing: 0; color: var(--accent); font-size: 14px; }
 
+    /* Screenshots */
+    .scr-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 14px;
+      margin-top: 10px;
+    }
+    .scr-card {
+      background: var(--panel-2);
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex; flex-direction: column;
+      transition: transform 0.1s;
+    }
+    .scr-card:hover { transform: translateY(-2px); }
+    .scr-card img {
+      width: 100%;
+      display: block;
+      aspect-ratio: 16 / 10;
+      object-fit: cover;
+      cursor: pointer;
+      background: #000;
+    }
+    .scr-meta { padding: 10px 12px; font-size: 12px; }
+    .scr-meta .top {
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 11px; color: var(--muted); margin-bottom: 4px;
+    }
+    .scr-meta .app { font-weight: 600; color: var(--text); margin: 4px 0; font-size: 13px; }
+    .scr-meta .title { color: var(--muted); word-break: break-word; }
+    .scr-meta .ocr {
+      margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border);
+      max-height: 60px; overflow: hidden; color: var(--muted);
+      font-size: 11px; line-height: 1.3;
+    }
+    .scr-cat {
+      display: inline-block; padding: 1px 6px; border-radius: 8px;
+      font-size: 10px; font-weight: 600;
+    }
+    .scr-cat.personal { background: #7f1d1d; color: #fecaca; }
+    .scr-cat.neutral { background: #475569; color: #cbd5e1; }
+    .scr-cat.work { background: #14532d; color: #bbf7d0; }
+    .scr-modal {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.92);
+      display: none; align-items: center; justify-content: center;
+      z-index: 100; padding: 20px;
+    }
+    .scr-modal.open { display: flex; }
+    .scr-modal img { max-width: 95vw; max-height: 90vh; border-radius: 8px; }
+    .scr-modal .close { position: absolute; top: 20px; right: 20px; color: white; font-size: 30px; cursor: pointer; }
+
     /* Voice segments */
     .voice-seg {
       display: grid; grid-template-columns: 70px 70px 1fr; gap: 10px;
@@ -369,6 +420,7 @@
         <button class="tab" data-tab="voice">Голос</button>
         <button class="tab" data-tab="conversations">Разговоры</button>
         <button class="tab" data-tab="windows">Окна</button>
+        <button class="tab" data-tab="screenshots">Скрины</button>
         <button class="tab" data-tab="daily">Daily Report</button>
       </nav>
 
@@ -442,6 +494,14 @@
         </div>
       </div>
 
+      <!-- Tab: Скрины -->
+      <div class="tab-content" data-tab-content="screenshots" hidden>
+        <div class="panel">
+          <h2>Скриншоты при заходе на личные/нейтральные сайты</h2>
+          <div id="screenshotsGrid"></div>
+        </div>
+      </div>
+
       <!-- Tab: Daily Report -->
       <div class="tab-content" data-tab-content="daily" hidden>
         <div class="panel">
@@ -458,6 +518,10 @@
       </div>
     </section>
   </main>
+  <div id="scrModal" class="scr-modal" onclick="this.classList.remove('open')">
+    <span class="close">&times;</span>
+    <img id="scrModalImg">
+  </div>
 
   <script>
     const $ = (s) => document.querySelector(s);
@@ -581,7 +645,7 @@
     async function loadAgentData() {
       if (!selectedAgent) return;
       const hours = $("#hours").value;
-      const [daySummaryR, windowsR, meetingsR, voiceR, activityR, convListR, convSumR] = await Promise.all([
+      const [daySummaryR, windowsR, meetingsR, voiceR, activityR, convListR, convSumR, scrR] = await Promise.all([
         fetch(`/agents/${selectedAgent}/day_summary?hours=${hours}`),
         fetch(`/agents/${selectedAgent}/windows?limit=50`),
         fetch(`/meetings?agent_id=${selectedAgent}&limit=20`),
@@ -589,6 +653,7 @@
         fetch(`/agents/${selectedAgent}/activity_summary?hours=${hours}`),
         fetch(`/agents/${selectedAgent}/conversations?hours=${hours}&limit=50`),
         fetch(`/agents/${selectedAgent}/conversations_summary?hours=${hours}`),
+        fetch(`/agents/${selectedAgent}/screenshots?hours=${hours}&limit=100`),
       ]);
       const daySummary = await daySummaryR.json();
       const windows = await windowsR.json();
@@ -597,6 +662,7 @@
       const activity = await activityR.json();
       const conversations = await convListR.json();
       const convSum = await convSumR.json();
+      const screenshots = await scrR.json();
 
       renderDayTiles(daySummary);
       renderActivityTiles(activity);
@@ -607,8 +673,38 @@
       renderVoice(voice);
       renderWindows(windows);
       renderConversations(conversations, convSum);
+      renderScreenshots(screenshots);
       $("#updated").textContent = "обновлено " + fmtTime(new Date().toISOString());
     }
+
+    function renderScreenshots(items) {
+      const el = $("#screenshotsGrid");
+      if (!items.length) {
+        el.innerHTML = '<div class="empty">скриншотов нет (нужно зайти на personal/neutral сайт)</div>';
+        return;
+      }
+      el.innerHTML = `<div class="scr-grid">${items.map(s => {
+        const cat = s.category || 'neutral';
+        const ocr = s.ocr_text ? s.ocr_text.slice(0, 200) : (s.ocr_done ? "(текст не распознан)" : "⏳ OCR в очереди");
+        return `<div class="scr-card">
+          <img src="/screenshots/${s.screenshot_id}/image" loading="lazy" onclick="window.openScreenshot(${s.screenshot_id})">
+          <div class="scr-meta">
+            <div class="top">
+              <span>${fmtTime(s.captured_at)}</span>
+              <span class="scr-cat ${cat}">${cat}</span>
+            </div>
+            <div class="app">${escapeHTML(s.app_name || '—')}</div>
+            <div class="title">${escapeHTML(s.title || '')}</div>
+            ${ocr ? `<div class="ocr">${escapeHTML(ocr)}</div>` : ''}
+          </div>
+        </div>`;
+      }).join("")}</div>`;
+    }
+
+    window.openScreenshot = function(id) {
+      $("#scrModalImg").src = `/screenshots/${id}/image`;
+      $("#scrModal").classList.add("open");
+    };
 
     function renderConversations(convs, summary) {
       // плитки сводки

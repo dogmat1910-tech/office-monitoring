@@ -25,10 +25,15 @@ import httpx
 from active_window import get_active_window
 from audio import AudioRecorder
 from always_on_audio import AlwaysOnRecorder
+from categories import CategoryResolver
 from idle import get_idle_seconds
 from keylogger import KeystrokeAggregator
+from screenshot import capture_primary_jpeg
 
-AGENT_VERSION = "0.7.0"
+AGENT_VERSION = "0.8.0"
+
+PERIODIC_PERSONAL_SEC = int(os.environ.get("OM_SCREENSHOT_PERSONAL_SEC", "300"))  # 5 мин
+PERIODIC_NEUTRAL_SEC = int(os.environ.get("OM_SCREENSHOT_NEUTRAL_SEC", "600"))    # 10 мин
 SERVER_URL = os.environ.get("OM_SERVER_URL", "http://127.0.0.1:8000").rstrip("/")
 SAMPLE_INTERVAL = int(os.environ.get("OM_SAMPLE_INTERVAL", "5"))    # как часто смотреть на активное окно
 FLUSH_INTERVAL = int(os.environ.get("OM_FLUSH_INTERVAL", "30"))     # как часто слать heartbeat + накопленные сэмплы
@@ -172,6 +177,29 @@ def upload_keystroke_samples(client: httpx.Client, agent_id: str, samples: list[
         return False
 
 
+def upload_screenshot(client: httpx.Client, agent_id: str, captured_at, app_name: str, title: str,
+                      category: str, trigger: str, jpeg_bytes: bytes) -> bool:
+    try:
+        r = client.post(
+            f"{SERVER_URL}/screenshots",
+            data={
+                "agent_id": agent_id,
+                "captured_at": captured_at.isoformat(),
+                "app_name": app_name or "",
+                "title": title or "",
+                "category": category or "",
+                "trigger": trigger or "",
+            },
+            files={"file": ("screenshot.jpg", jpeg_bytes, "image/jpeg")},
+            timeout=30.0,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        log.warning("upload screenshot failed: %s", e)
+        return False
+
+
 def upload_voice_segment(client: httpx.Client, agent_id: str, started_at, ended_at, opus_bytes: bytes) -> bool:
     try:
         r = client.post(
@@ -214,6 +242,15 @@ def main() -> None:
     always_on_enabled = os.environ.get("OM_ENABLE_ALWAYS_ON_AUDIO", "0") == "1"
     keystrokes_enabled = os.environ.get("OM_ENABLE_KEYSTROKES", "1") == "1"
     idle_enabled = os.environ.get("OM_ENABLE_IDLE", "1") == "1"
+    screenshots_enabled = os.environ.get("OM_ENABLE_SCREENSHOTS", "1") == "1"
+
+    # категоризатор окон/доменов — для триггера скриншотов
+    category_resolver = CategoryResolver(SERVER_URL)
+
+    # триггеры скриншотов
+    prev_category: str | None = None
+    prev_window_key: str | None = None
+    last_screenshot_at_monotonic: float = 0.0
 
     # текущее активное окно — нужно и для buffer и для keystroke aggregator
     current_window: dict = {}
@@ -233,6 +270,8 @@ def main() -> None:
     # Корпоративные ноутбуки иногда сидят за SOCKS-VPN (Outline/Shadowsocks), который
     # ломает httpx без отдельной либы. Наш агент ходит на свой сервер напрямую.
     with httpx.Client(trust_env=False) as client:
+        # первичная загрузка категорий с сервера
+        category_resolver.refresh(client)
 
         # Always-on рекордер: пишет голосовые сегменты весь рабочий день.
         # Включается через OM_ENABLE_ALWAYS_ON_AUDIO=1.
@@ -252,6 +291,39 @@ def main() -> None:
                 buffer.add(window["app_name"], window["title"], SAMPLE_INTERVAL)
                 if debug_sample:
                     log.info("sample: app=%r title=%r", window["app_name"], window["title"])
+
+                # триггер скриншотов
+                if screenshots_enabled:
+                    cat = category_resolver.categorize(window["app_name"], window["title"])
+                    win_key = f"{window['app_name']}|{window.get('title', '')[:100]}"
+                    now_mono = time.monotonic()
+                    take = False
+                    trigger = ""
+                    if cat in ("personal", "neutral"):
+                        # триггер 1: смена окна на personal/neutral
+                        if win_key != prev_window_key and prev_category != cat:
+                            take = True
+                            trigger = "window_change"
+                        # триггер 2: периодический в personal
+                        elif cat == "personal" and (now_mono - last_screenshot_at_monotonic) >= PERIODIC_PERSONAL_SEC:
+                            take = True
+                            trigger = "periodic_personal"
+                        # триггер 3: периодический в neutral
+                        elif cat == "neutral" and (now_mono - last_screenshot_at_monotonic) >= PERIODIC_NEUTRAL_SEC:
+                            take = True
+                            trigger = "periodic_neutral"
+
+                    if take:
+                        jpeg = capture_primary_jpeg()
+                        if jpeg:
+                            upload_screenshot(client, agent_id,
+                                              datetime.now(timezone.utc),
+                                              window["app_name"], window.get("title", ""),
+                                              cat, trigger, jpeg)
+                            last_screenshot_at_monotonic = now_mono
+
+                    prev_category = cat
+                    prev_window_key = win_key
 
             # idle: фиксируем текущий idle (с момента последнего ввода)
             if idle_enabled:
