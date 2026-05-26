@@ -27,7 +27,9 @@ PyInstaller с `--onefile` собирает:
 - Все зависимости из requirements.txt
 - Все .py-модули агента
 
-Размер итогового `office-monitoring-agent.exe` — около **70-100 MB**.
+Размер итогового `office-monitoring-agent.exe` — **~31 MB** (watchdog — ~8 MB).
+PyTorch/whisper/pyannote НЕ упакованы — они только на сервере, агент шлёт сырой
+аудио и LLM-анализ делает сервер.
 
 При запуске exe распаковывается во временную папку `%TEMP%\_MEIxxxxxx`,
 оттуда выполняется. Это нормальное поведение `--onefile`.
