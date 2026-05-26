@@ -87,8 +87,12 @@ jobs:
 
       - name: Publish to Release (только при release)
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: agent/dist/*.exe
+        shell: pwsh
+        working-directory: agent
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # Используем gh CLI (он уже на windows-latest runner'е) вместо стороннего
+          # softprops/action-gh-release@v2, чтобы не зависеть от его доступности.
+          gh release upload "$env:TAG" (Get-Item dist\*.exe).FullName --clobber
