@@ -18,6 +18,8 @@ AUDIO_DIR = BASE_DIR / "audio_data"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 VOICE_DIR = BASE_DIR / "voice_data"
 VOICE_DIR.mkdir(parents=True, exist_ok=True)
+SCREENSHOTS_DIR = BASE_DIR / "screenshots_data"
+SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, connect_args={"check_same_thread": False})
 
 # Токен для эндпоинтов которые дёргает внешний сервис (твой самописный календарь).
@@ -106,6 +108,25 @@ class DomainCategory(SQLModel, table=True):
     domain: str = Field(index=True, unique=True)
     category: str  # work | personal | neutral
     updated_at: datetime
+
+
+class Screenshot(SQLModel, table=True):
+    """Скриншот primary monitor'а агента, делается при заходе в personal/neutral.
+    Хранится JPEG 1280px q=70 в screenshots_data/{agent_id}/{date}/{HH}/.
+    OCR-текст заполняется фоновым воркером (Tesseract рус+англ)."""
+    id: int | None = Field(default=None, primary_key=True)
+    agent_id: str = Field(index=True)
+    captured_at: datetime = Field(index=True)
+    app_name: str | None = Field(default=None, index=True)
+    title: str | None = None
+    category: str | None = Field(default=None, index=True)  # work | personal | neutral
+    trigger: str | None = None  # window_change | periodic_personal | periodic_neutral
+    file_path: str  # относительно SCREENSHOTS_DIR
+    size_bytes: int
+    received_at: datetime
+    # OCR (заполняется воркером):
+    ocr_text: str | None = None
+    ocr_at: datetime | None = None
 
 
 class IdleSample(SQLModel, table=True):
@@ -1059,6 +1080,93 @@ async def upload_voice_segment(
         session.commit()
         session.refresh(seg)
         return {"status": "ok", "segment_id": seg.id, "size_bytes": len(contents), "duration_seconds": duration}
+
+
+# ---------- Screenshots ----------
+
+@app.post("/screenshots")
+async def upload_screenshot(
+    agent_id: str = Form(...),
+    captured_at: str = Form(...),
+    app_name: str = Form(""),
+    title: str = Form(""),
+    category: str = Form(""),
+    trigger: str = Form(""),
+    file: UploadFile = File(...),
+) -> dict:
+    """Агент шлёт скриншот при triger-условии."""
+    contents = await file.read()
+    try:
+        ts = _as_utc(datetime.fromisoformat(captured_at))
+    except ValueError as e:
+        raise HTTPException(400, f"некорректный captured_at: {e}")
+
+    # путь: screenshots_data/{agent_id}/{YYYY-MM-DD}/{HH}/scr_{ms}.jpg
+    rel_dir = Path(agent_id) / ts.strftime("%Y-%m-%d") / ts.strftime("%H")
+    abs_dir = SCREENSHOTS_DIR / rel_dir
+    abs_dir.mkdir(parents=True, exist_ok=True)
+    fname = f"scr_{int(ts.timestamp() * 1000)}.jpg"
+    abs_path = abs_dir / fname
+    abs_path.write_bytes(contents)
+    rel_path = str(rel_dir / fname)
+
+    with Session(engine) as session:
+        sh = Screenshot(
+            agent_id=agent_id,
+            captured_at=ts,
+            app_name=app_name or None,
+            title=title or None,
+            category=category or None,
+            trigger=trigger or None,
+            file_path=rel_path,
+            size_bytes=len(contents),
+            received_at=datetime.now(timezone.utc),
+        )
+        session.add(sh)
+        session.commit()
+        session.refresh(sh)
+        return {"status": "ok", "screenshot_id": sh.id, "size_bytes": len(contents)}
+
+
+@app.get("/screenshots/{screenshot_id}/image")
+def get_screenshot_image(screenshot_id: int):
+    """Отдаёт сам JPEG (под basic auth через Caddy для дашборда)."""
+    from fastapi.responses import FileResponse
+    with Session(engine) as session:
+        sh = session.exec(select(Screenshot).where(Screenshot.id == screenshot_id)).first()
+        if sh is None:
+            raise HTTPException(404, "screenshot not found")
+        path = SCREENSHOTS_DIR / sh.file_path
+        if not path.exists():
+            raise HTTPException(404, "file not found")
+        return FileResponse(path, media_type="image/jpeg")
+
+
+@app.get("/agents/{agent_id}/screenshots")
+def list_screenshots(agent_id: str, hours: int = 24, limit: int = 200) -> list[dict]:
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    with Session(engine) as session:
+        rows = session.exec(
+            select(Screenshot)
+            .where(Screenshot.agent_id == agent_id)
+            .where(Screenshot.captured_at >= since)
+            .order_by(Screenshot.captured_at.desc())
+            .limit(limit)
+        ).all()
+        return [
+            {
+                "screenshot_id": s.id,
+                "captured_at": _as_utc(s.captured_at).isoformat(),
+                "app_name": s.app_name,
+                "title": s.title,
+                "category": s.category,
+                "trigger": s.trigger,
+                "size_bytes": s.size_bytes,
+                "ocr_text": s.ocr_text,
+                "ocr_done": s.ocr_at is not None,
+            }
+            for s in rows
+        ]
 
 
 @app.get("/agents/{agent_id}/conversations")

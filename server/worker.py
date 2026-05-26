@@ -19,13 +19,14 @@ from pathlib import Path
 from sqlmodel import Session, select
 
 # импорт моделей и engine из main.py
-from main import AUDIO_DIR, VOICE_DIR, Analysis, AudioChunk, DailyReport, Meeting, Transcript, VoiceSegment, engine
+from main import AUDIO_DIR, VOICE_DIR, SCREENSHOTS_DIR, Analysis, AudioChunk, DailyReport, Meeting, Screenshot, Transcript, VoiceSegment, engine
 from analyze import analyze_transcript
 from analyze_conversation import analyze_conversation
 from classify_voice import auto_bind_meeting_id, classify_voice_segment
 from conversations import cluster_pending_segments, get_active_agents_with_pending_segments
 from daily_report import generate_daily_report
 from diarization import diarize_conversation
+from ocr import ocr_image
 from transcribe import get_model, transcribe_meeting, transcribe_voice_segment
 
 logging.basicConfig(
@@ -123,6 +124,37 @@ def process_conversation_analysis(conv_id: int) -> None:
                 c.analyzed_at = datetime.now(timezone.utc)
                 session.add(c)
                 session.commit()
+
+
+def find_pending_ocr() -> int | None:
+    """Screenshot без OCR-текста."""
+    with Session(engine) as session:
+        s = session.exec(
+            select(Screenshot)
+            .where(Screenshot.ocr_at.is_(None))
+            .order_by(Screenshot.captured_at)
+        ).first()
+        return s.id if s else None
+
+
+def process_ocr(screenshot_id: int) -> None:
+    with Session(engine) as session:
+        sh = session.exec(select(Screenshot).where(Screenshot.id == screenshot_id)).first()
+        if sh is None:
+            return
+        path = SCREENSHOTS_DIR / sh.file_path
+        if not path.exists():
+            log.warning("screenshot %d: файл не найден %s", screenshot_id, path)
+            sh.ocr_text = "[файл не найден]"
+            sh.ocr_at = datetime.now(timezone.utc)
+            session.add(sh)
+            session.commit()
+            return
+        text = ocr_image(path)
+        sh.ocr_text = text
+        sh.ocr_at = datetime.now(timezone.utc)
+        session.add(sh)
+        session.commit()
 
 
 def find_pending_diarization() -> int | None:
@@ -409,6 +441,12 @@ def process_one() -> bool:
         if conv_id is not None:
             process_diarization(conv_id)
             return True
+
+    # Этап 2.95: OCR скриншотов
+    scr_id = find_pending_ocr()
+    if scr_id is not None:
+        process_ocr(scr_id)
+        return True
 
     # Этап 3: pending daily reports
     pending_report = find_pending_daily_report()
