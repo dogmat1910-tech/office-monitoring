@@ -1,0 +1,86 @@
+name: Build Windows Agent
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'agent/**'
+      - '.github/workflows/build-agent.yml'
+  workflow_dispatch:
+  release:
+    types: [created]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: 'agent/requirements.txt'
+
+      - name: Install agent dependencies
+        working-directory: agent
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Read agent version
+        id: ver
+        shell: pwsh
+        working-directory: agent
+        run: |
+          $line = Select-String -Path agent.py -Pattern 'AGENT_VERSION\s*=\s*"([^"]+)"' | Select-Object -First 1
+          $v = $line.Matches[0].Groups[1].Value
+          echo "version=$v" >> $env:GITHUB_OUTPUT
+          echo "Agent version: $v"
+
+      - name: Build agent.exe
+        working-directory: agent
+        run: |
+          pyinstaller --onefile `
+            --name office-monitoring-agent `
+            --noconsole `
+            --hidden-import=pynput.keyboard._win32 `
+            --hidden-import=pynput.mouse._win32 `
+            --hidden-import=win32gui `
+            --hidden-import=win32process `
+            --collect-all=webrtcvad `
+            --collect-all=soundfile `
+            --collect-all=sounddevice `
+            --collect-all=mss `
+            agent.py
+
+      - name: Build watchdog.exe
+        working-directory: agent
+        run: |
+          pyinstaller --onefile `
+            --name office-monitoring-watchdog `
+            --noconsole `
+            watchdog.py
+
+      - name: List artifacts
+        working-directory: agent
+        run: |
+          dir dist
+          Get-Item dist\*.exe | Format-Table Name, Length
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: office-monitoring-agent-windows-${{ steps.ver.outputs.version }}
+          path: agent/dist/*.exe
+          retention-days: 30
+
+      - name: Publish to Release (только при release)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: agent/dist/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
