@@ -138,6 +138,7 @@ class AppCategory(SQLModel, table=True):
     updated_at: datetime
     auto_categorized: bool = False  # True если LLM определил
     confidence: float | None = None  # 0..1, оценка уверенности LLM
+    reason: str | None = None  # объяснение LLM, видно админу при аудите
 
 
 class DomainCategory(SQLModel, table=True):
@@ -148,6 +149,21 @@ class DomainCategory(SQLModel, table=True):
     updated_at: datetime
     auto_categorized: bool = False
     confidence: float | None = None
+    reason: str | None = None
+
+
+class CategoryAuditFeedback(SQLModel, table=True):
+    """Подтверждения/опровержения LLM-категоризации админом.
+    По этим данным считаем accuracy и формируем few-shot примеры для промпта."""
+    id: int | None = Field(default=None, primary_key=True)
+    kind: str = Field(index=True)  # "app" | "domain"
+    name: str = Field(index=True)
+    llm_category: str
+    llm_confidence: float | None = None
+    admin_verdict: str  # "correct" | "incorrect"
+    admin_category: str | None = None  # если incorrect — что правильно
+    admin_comment: str | None = None
+    reviewed_at: datetime
 
 
 class Screenshot(SQLModel, table=True):
@@ -1139,6 +1155,141 @@ def admin_recategorize(lookback_days: int = 7) -> dict:
     apps_added = ac.categorize_new_apps(engine, lookback_days=lookback_days)
     domains_added = ac.categorize_new_domains(engine, lookback_days=lookback_days)
     return {"apps_added": apps_added, "domains_added": domains_added}
+
+
+@app.get("/audit/categories")
+def audit_list_categories(
+    limit: int = 20,
+    only_unreviewed: bool = True,
+    min_confidence: float = 0.0,
+    max_confidence: float = 1.0,
+) -> dict:
+    """Возвращает LLM-категоризации для проверки админом.
+    По умолчанию — только те, что ещё не проверены.
+    Сортировка: сначала с низкой confidence (там вероятнее ошибка)."""
+    with Session(engine) as session:
+        reviewed_keys = {
+            (r.kind, r.name) for r in session.exec(select(CategoryAuditFeedback)).all()
+        } if only_unreviewed else set()
+
+        apps = [
+            r for r in session.exec(
+                select(AppCategory)
+                .where(AppCategory.auto_categorized == True)  # noqa: E712
+                .where(AppCategory.confidence >= min_confidence)
+                .where(AppCategory.confidence <= max_confidence)
+            ).all()
+            if not only_unreviewed or ("app", r.app_name) not in reviewed_keys
+        ]
+        domains = [
+            r for r in session.exec(
+                select(DomainCategory)
+                .where(DomainCategory.auto_categorized == True)  # noqa: E712
+                .where(DomainCategory.confidence >= min_confidence)
+                .where(DomainCategory.confidence <= max_confidence)
+            ).all()
+            if not only_unreviewed or ("domain", r.domain) not in reviewed_keys
+        ]
+        items = (
+            [{"kind": "app", "name": r.app_name, "category": r.category,
+              "confidence": r.confidence, "reason": r.reason,
+              "updated_at": _as_utc(r.updated_at).isoformat()} for r in apps]
+            + [{"kind": "domain", "name": r.domain, "category": r.category,
+                "confidence": r.confidence, "reason": r.reason,
+                "updated_at": _as_utc(r.updated_at).isoformat()} for r in domains]
+        )
+        # Сначала с низкой уверенностью — там вероятнее ошибка
+        items.sort(key=lambda x: (x["confidence"] or 0))
+        return {"items": items[:limit], "total": len(items)}
+
+
+class CategoryFeedbackIn(BaseModel):
+    kind: str  # app | domain
+    name: str
+    verdict: str  # correct | incorrect
+    admin_category: str | None = None  # work | personal | neutral если incorrect
+    comment: str | None = None
+
+
+@app.post("/audit/categories/feedback")
+def audit_post_feedback(payload: CategoryFeedbackIn) -> dict:
+    if payload.kind not in {"app", "domain"}:
+        raise HTTPException(400, "kind должен быть app или domain")
+    if payload.verdict not in {"correct", "incorrect"}:
+        raise HTTPException(400, "verdict должен быть correct или incorrect")
+    if payload.verdict == "incorrect":
+        if payload.admin_category not in {"work", "personal", "neutral"}:
+            raise HTTPException(400, "при verdict=incorrect нужен admin_category")
+
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        if payload.kind == "app":
+            row = session.exec(select(AppCategory).where(AppCategory.app_name == payload.name)).first()
+        else:
+            row = session.exec(select(DomainCategory).where(DomainCategory.domain == payload.name)).first()
+        if not row:
+            raise HTTPException(404, f"{payload.kind} {payload.name} не найден")
+
+        # Сохраняем фидбек
+        session.add(CategoryAuditFeedback(
+            kind=payload.kind,
+            name=payload.name,
+            llm_category=row.category,
+            llm_confidence=row.confidence,
+            admin_verdict=payload.verdict,
+            admin_category=payload.admin_category,
+            admin_comment=payload.comment,
+            reviewed_at=now,
+        ))
+
+        # Если incorrect — сразу переписываем категорию руками (LLM больше не трогает)
+        if payload.verdict == "incorrect":
+            row.category = payload.admin_category
+            row.auto_categorized = False
+            row.confidence = None
+            row.updated_at = now
+            session.add(row)
+
+        session.commit()
+        return {"ok": True}
+
+
+@app.get("/audit/categories/stats")
+def audit_stats(lookback_days: int = 7) -> dict:
+    """Сводка accuracy LLM-категоризации за период."""
+    since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    with Session(engine) as session:
+        rows = session.exec(
+            select(CategoryAuditFeedback).where(CategoryAuditFeedback.reviewed_at >= since)
+        ).all()
+        total = len(rows)
+        correct = sum(1 for r in rows if r.admin_verdict == "correct")
+        incorrect = total - correct
+        by_category: dict[str, dict] = {}
+        for r in rows:
+            cat = r.llm_category
+            by_category.setdefault(cat, {"correct": 0, "incorrect": 0})
+            by_category[cat]["correct" if r.admin_verdict == "correct" else "incorrect"] += 1
+        # ТОП-5 неверных решений — для выявления паттерна ошибок
+        wrong = [
+            {
+                "kind": r.kind, "name": r.name,
+                "llm_category": r.llm_category, "admin_category": r.admin_category,
+                "comment": r.admin_comment, "reviewed_at": _as_utc(r.reviewed_at).isoformat(),
+            }
+            for r in rows if r.admin_verdict == "incorrect"
+        ]
+        wrong = sorted(wrong, key=lambda x: x["reviewed_at"], reverse=True)[:10]
+        accuracy = (correct / total) if total else None
+        return {
+            "lookback_days": lookback_days,
+            "total_reviewed": total,
+            "correct": correct,
+            "incorrect": incorrect,
+            "accuracy": accuracy,
+            "by_llm_category": by_category,
+            "recent_wrong": wrong,
+        }
 
 
 @app.get("/agents/{agent_id}/day_summary")

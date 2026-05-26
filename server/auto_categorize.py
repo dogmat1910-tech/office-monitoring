@@ -65,11 +65,12 @@ SYSTEM_PROMPT = """Ты категоризатор активности мене
 - Браузеры сами по себе (chrome.exe, firefox.exe, msedge.exe) — neutral. Конкретные домены внутри классифицируются отдельно.
 - IDE (если менеджер не разработчик) — neutral
 
-Формат ответа: ТОЛЬКО валидный JSON, без обёртки markdown, без объяснений.
-Структура: {"имя1": {"category": "work|personal|neutral", "confidence": 0.0-1.0}, ...}
+Формат ответа: ТОЛЬКО валидный JSON, без обёртки markdown.
+Структура: {"имя1": {"category": "work|personal|neutral", "confidence": 0.0-1.0, "reason": "короткое объяснение почему"}, ...}
 
-confidence — твоя уверенность, что категория верна (0.9 = очень уверен; 0.5 = неоднозначно).
-Если ничего не знаешь про элемент — confidence ставь низкое (0.3-0.5), категорию "neutral".
+confidence — твоя уверенность (0.9 = очень уверен; 0.5 = неоднозначно).
+reason — 1 предложение, максимум 80 символов, почему именно эта категория. Это видит админ при аудите.
+Если не знаешь — confidence 0.3-0.5, категорию "neutral", reason "недостаточно контекста".
 """
 
 
@@ -82,8 +83,8 @@ def _clean_json(text: str) -> str:
     return text.strip()
 
 
-def classify_batch(items: list[str], kind: str) -> dict[str, tuple[str, float]]:
-    """Шлёт батч имён в LLM, возвращает {item: (category, confidence)}.
+def classify_batch(items: list[str], kind: str) -> dict[str, tuple[str, float, str]]:
+    """Шлёт батч имён в LLM, возвращает {item: (category, confidence, reason)}.
 
     kind: "приложений" или "веб-доменов" — для подсказки LLM в user-промпте.
     """
@@ -120,20 +121,21 @@ def classify_batch(items: list[str], kind: str) -> dict[str, tuple[str, float]]:
         log.warning("LLM classify failed: %s", e)
         return {}
 
-    result: dict[str, tuple[str, float]] = {}
+    result: dict[str, tuple[str, float, str]] = {}
     for item in items:
         entry = data.get(item)
         if not isinstance(entry, dict):
             continue
         category = entry.get("category")
         confidence = entry.get("confidence")
+        reason = (entry.get("reason") or "").strip()[:160]
         if category not in {"work", "personal", "neutral"}:
             continue
         try:
             conf = float(confidence)
         except (TypeError, ValueError):
             conf = 0.5
-        result[item] = (category, max(0.0, min(1.0, conf)))
+        result[item] = (category, max(0.0, min(1.0, conf)), reason)
     return result
 
 
@@ -165,13 +167,14 @@ def categorize_new_apps(engine, lookback_days: int = 7) -> int:
             results = classify_batch(batch, "приложений")
             now = datetime.now(timezone.utc)
             for name in batch:
-                cat, conf = results.get(name, ("neutral", 0.3))
+                cat, conf, reason = results.get(name, ("neutral", 0.3, "LLM не ответил"))
                 session.add(AppCategory(
                     app_name=name,
                     category=cat,
                     updated_at=now,
                     auto_categorized=True,
                     confidence=conf,
+                    reason=reason or None,
                 ))
                 added += 1
             session.commit()
@@ -212,13 +215,14 @@ def categorize_new_domains(engine, lookback_days: int = 7) -> int:
             results = classify_batch(batch, "веб-доменов")
             now = datetime.now(timezone.utc)
             for name in batch:
-                cat, conf = results.get(name, ("neutral", 0.3))
+                cat, conf, reason = results.get(name, ("neutral", 0.3, "LLM не ответил"))
                 session.add(DomainCategory(
                     domain=name,
                     category=cat,
                     updated_at=now,
                     auto_categorized=True,
                     confidence=conf,
+                    reason=reason or None,
                 ))
                 added += 1
             session.commit()

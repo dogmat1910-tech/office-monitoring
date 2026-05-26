@@ -425,6 +425,7 @@
         <button class="tab" data-tab="windows">Окна</button>
         <button class="tab" data-tab="screenshots">Скрины</button>
         <button class="tab" data-tab="daily">Daily Report</button>
+        <button class="tab" data-tab="audit">🔍 Audit LLM</button>
       </nav>
 
       <!-- Tab: Команда -->
@@ -527,6 +528,19 @@
           <div id="dailyContent"></div>
         </div>
       </div>
+
+      <!-- Tab: Audit LLM — ручная проверка категоризаций -->
+      <div class="tab-content" data-tab-content="audit" hidden>
+        <div class="panel">
+          <h2>🔍 Аудит LLM-категоризации</h2>
+          <div class="muted" style="margin-bottom: 16px;">
+            Проверь несколько случайных решений LLM. По низкой confidence сначала.
+            Если LLM решил неверно — поправь, и эта запись больше не будет переопределяться автоматически.
+          </div>
+          <div id="auditStats" style="margin-bottom: 16px;"></div>
+          <div id="auditList"></div>
+        </div>
+      </div>
     </section>
   </main>
   <div id="scrModal" class="scr-modal" onclick="this.classList.remove('open')">
@@ -603,6 +617,9 @@
         loadTeam();
       } else if (name === "daily" && selectedAgent) {
         pollDailyReport(selectedAgent, $("#dailyDate").value);
+      } else if (name === "audit") {
+        loadAudit();
+        clearDailyPoll();
       } else {
         clearDailyPoll();
       }
@@ -1242,6 +1259,92 @@
     }
 
     // ───────────── Диагностика агента (модалка) ─────────────
+    // ───────────── Audit LLM ─────────────
+    async function loadAudit() {
+      const [statsR, listR] = await Promise.all([
+        fetch("/audit/categories/stats?lookback_days=7"),
+        fetch("/audit/categories?limit=30&only_unreviewed=true"),
+      ]);
+      const stats = await statsR.json();
+      const list = await listR.json();
+      renderAuditStats(stats);
+      renderAuditList(list.items, list.total);
+    }
+
+    function renderAuditStats(s) {
+      const acc = s.accuracy === null ? "—" : `${(s.accuracy * 100).toFixed(1)}%`;
+      const accColor = s.accuracy === null ? "#888" : (s.accuracy >= 0.9 ? "#4ade80" : (s.accuracy >= 0.75 ? "#fbbf24" : "#f87171"));
+      const recentWrong = (s.recent_wrong || []).map(w => {
+        const llm = w.llm_category, adm = w.admin_category || "?";
+        return `<div style="font-size: 12px; opacity: 0.8;">• ${escapeHTML(w.kind)} <b>${escapeHTML(w.name)}</b> — LLM сказал <span class="${llm}">${llm}</span>, на самом деле <span class="${adm}">${adm}</span>${w.comment ? " · " + escapeHTML(w.comment) : ""}</div>`;
+      }).join("");
+      $("#auditStats").innerHTML = `
+        <div style="display: flex; gap: 24px; align-items: center; padding: 12px; background: rgba(255,255,255,0.04); border-radius: 8px;">
+          <div>
+            <div class="muted" style="font-size: 11px;">accuracy за ${s.lookback_days} дн.</div>
+            <div style="font-size: 24px; font-weight: 700; color: ${accColor};">${acc}</div>
+          </div>
+          <div>
+            <div class="muted" style="font-size: 11px;">проверено</div>
+            <div style="font-size: 20px;">${s.total_reviewed}</div>
+          </div>
+          <div>
+            <div class="muted" style="font-size: 11px;">верно / неверно</div>
+            <div style="font-size: 14px;"><span style="color: #4ade80;">${s.correct}</span> / <span style="color: #f87171;">${s.incorrect}</span></div>
+          </div>
+        </div>
+        ${recentWrong ? `<details style="margin-top: 8px;"><summary class="muted" style="cursor: pointer;">недавние ошибки LLM</summary><div style="margin-top: 4px;">${recentWrong}</div></details>` : ""}
+      `;
+    }
+
+    function renderAuditList(items, total) {
+      const el = $("#auditList");
+      if (!items.length) {
+        el.innerHTML = '<div class="empty">всё уже проверено или LLM ещё не работал</div>';
+        return;
+      }
+      el.innerHTML = `<div class="muted" style="margin-bottom: 8px;">${items.length} из ${total} непроверенных, отсортировано по возрастанию confidence</div>` +
+        items.map(item => {
+          const confPct = item.confidence !== null ? Math.round(item.confidence * 100) : null;
+          const confColor = confPct === null ? "#888" : (confPct >= 80 ? "#4ade80" : (confPct >= 60 ? "#fbbf24" : "#f87171"));
+          const icon = item.kind === "domain" ? "🌐" : "📦";
+          const safeName = item.name.replace(/'/g, "&#39;");
+          return `<div class="bar-row" style="grid-template-columns: 1fr auto auto auto; align-items: center; padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.06);">
+            <div>
+              <div>${icon} <b>${escapeHTML(item.name)}</b></div>
+              <div class="muted" style="font-size: 11px; margin-top: 2px;">LLM: <span class="${item.category}">${item.category}</span> · conf <span style="color: ${confColor};">${confPct ?? "—"}%</span>${item.reason ? " · " + escapeHTML(item.reason) : ""}</div>
+            </div>
+            <button class="btn-primary" style="background: #4ade80; padding: 6px 10px;" onclick="window.auditVerdict('${item.kind}', '${safeName}', 'correct')">✅ верно</button>
+            <select id="audit-cat-${item.kind}-${safeName}" style="padding: 4px;">
+              <option value="work">→ работа</option>
+              <option value="personal">→ личное</option>
+              <option value="neutral">→ нейтр.</option>
+            </select>
+            <button class="btn-secondary" style="background: #f87171; padding: 6px 10px;" onclick="window.auditVerdict('${item.kind}', '${safeName}', 'incorrect')">❌ неверно</button>
+          </div>`;
+        }).join("");
+    }
+
+    window.auditVerdict = async function(kind, name, verdict) {
+      const body = { kind, name, verdict };
+      if (verdict === "incorrect") {
+        const sel = document.getElementById(`audit-cat-${kind}-${name}`);
+        body.admin_category = sel ? sel.value : "neutral";
+        const comment = prompt("Комментарий (опционально, для отладки промпта):", "");
+        if (comment) body.comment = comment;
+      }
+      const r = await fetch("/audit/categories/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        alert(`Не сохранил: ${r.status} ${await r.text()}`);
+        return;
+      }
+      loadAudit();
+    };
+
     window.renameAgent = async function(agentId, currentName) {
       const newName = prompt("Имя менеджера (пусто = сбросить, показывать hostname):", currentName || "");
       if (newName === null) return;  // отмена
