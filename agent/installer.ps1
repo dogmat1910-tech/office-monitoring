@@ -91,9 +91,13 @@ start "" "$watchPath"
 Info "Регистрирую Scheduled Task '$TaskAgent'..."
 Unregister-ScheduledTask -TaskName $TaskAgent -Confirm:$false -ErrorAction SilentlyContinue
 
+# BUILTIN\Users локализуется на ru-RU как BUILTIN\Пользователи —
+# резолвим через SID, который одинаков на любой локали.
+$usersGroup = (New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-545")).Translate([System.Security.Principal.NTAccount]).Value
+
 $action    = New-ScheduledTaskAction -Execute $runAgentBat
 $trigger   = New-ScheduledTaskTrigger -AtLogOn
-$principal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Users" -RunLevel Highest
+$principal = New-ScheduledTaskPrincipal -GroupId $usersGroup -RunLevel Highest
 $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                 -ExecutionTimeLimit (New-TimeSpan -Days 0) `
                 -RestartCount 9999 -RestartInterval (New-TimeSpan -Minutes 1) `
