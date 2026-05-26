@@ -28,6 +28,10 @@ AGENT_LOG = DATA_DIR / "agent.log"
 WATCHDOG_LOG = DATA_DIR / "watchdog.log"
 WATCHDOG_PID_FILE = DATA_DIR / "watchdog.pid"
 AGENT_EXE = INSTALL_DIR / "office-monitoring-agent.exe"
+WATCHDOG_EXE = INSTALL_DIR / "office-monitoring-watchdog.exe"
+AGENT_EXE_NEW = INSTALL_DIR / "office-monitoring-agent.exe.new"
+WATCHDOG_EXE_NEW = INSTALL_DIR / "office-monitoring-watchdog.exe.new"
+UPDATE_MARKER = DATA_DIR / "UPDATE_PENDING"
 AGENT_PROCESS_NAME = "office-monitoring-agent.exe"
 WATCHDOG_PROCESS_NAME = "office-monitoring-watchdog.exe"
 
@@ -121,11 +125,93 @@ def start_agent() -> None:
         log(f"start_agent error: {e}")
 
 
+def apply_pending_update() -> bool:
+    """Если есть маркер UPDATE_PENDING — делаем atomic swap .exe.new → .exe.
+
+    Возвращает True если нужно завершить watchdog (например, чтобы applied watchdog.exe.new
+    через внешний cmd-helper). False — если просто обновили agent и продолжаем работу.
+    """
+    if not UPDATE_MARKER.exists():
+        return False
+
+    log(f"applying pending update ({UPDATE_MARKER.read_text().strip()!r})")
+
+    # 1) agent.exe swap — сначала прибиваем живой процесс
+    if AGENT_EXE_NEW.exists():
+        proc = find_process_by_name(AGENT_PROCESS_NAME)
+        if proc is not None:
+            try:
+                log(f"killing running agent (pid={proc.pid}) перед swap")
+                proc.kill()
+                proc.wait(timeout=10)
+            except Exception as e:
+                log(f"kill agent failed: {e} — отложим обновление до след. цикла")
+                return False
+        try:
+            agent_old = INSTALL_DIR / "office-monitoring-agent.exe.old"
+            if agent_old.exists():
+                agent_old.unlink()
+            if AGENT_EXE.exists():
+                AGENT_EXE.rename(agent_old)
+            AGENT_EXE_NEW.rename(AGENT_EXE)
+            log("agent.exe swapped")
+        except Exception as e:
+            log(f"swap agent.exe failed: {e}")
+            return False
+
+    # 2) watchdog.exe swap — мы сами запущены, поэтому делегируем cmd-скрипту,
+    # который дождётся нашего выхода и переименует .new → .exe, затем запустит свежий watchdog.
+    if WATCHDOG_EXE_NEW.exists():
+        helper = INSTALL_DIR / "apply-watchdog-update.cmd"
+        helper.write_text(
+            "@echo off\r\n"
+            "setlocal\r\n"
+            ":wait_loop\r\n"
+            f'tasklist /FI "IMAGENAME eq {WATCHDOG_PROCESS_NAME}" 2>nul | findstr {WATCHDOG_PROCESS_NAME} >nul\r\n'
+            "if not errorlevel 1 (\r\n"
+            "    timeout /t 2 /nobreak >nul\r\n"
+            "    goto :wait_loop\r\n"
+            ")\r\n"
+            f'del /F "{WATCHDOG_EXE}.old" 2>nul\r\n'
+            f'move /Y "{WATCHDOG_EXE}" "{WATCHDOG_EXE}.old" >nul\r\n'
+            f'move /Y "{WATCHDOG_EXE_NEW}" "{WATCHDOG_EXE}" >nul\r\n'
+            f'start "" "{INSTALL_DIR / "run-watchdog.cmd"}"\r\n'
+            'del "%~f0"\r\n',
+            encoding="ascii",
+        )
+        try:
+            subprocess.Popen(
+                ["cmd.exe", "/c", str(helper)],
+                cwd=str(INSTALL_DIR),
+                creationflags=0x00000008 | 0x08000000,
+            )
+            log("watchdog-update helper launched, exiting")
+        except Exception as e:
+            log(f"launch helper failed: {e}")
+        # Запускаем новую версию агента до выхода — чтобы он не простаивал пока helper
+        # ждёт смерти watchdog'а (несколько секунд)
+        UPDATE_MARKER.unlink(missing_ok=True)
+        start_agent()
+        return True
+
+    # Обновился только агент
+    UPDATE_MARKER.unlink(missing_ok=True)
+    log("update applied (agent only), starting new agent")
+    start_agent()
+    return False
+
+
 def main() -> None:
     ensure_single_watchdog()
     log(f"watchdog starting (interval={WATCHDOG_INTERVAL}s, stale={STALE_LOG_SEC}s, pid={os.getpid()})")
+    # На старте — применяем оставшийся с прошлого раза апдейт (если есть)
+    if apply_pending_update():
+        return
     while True:
         try:
+            # Каждый тик — сначала смотрим, нет ли свежего апдейта
+            if apply_pending_update():
+                return
             alive = agent_process_alive()
             fresh = agent_log_fresh()
             if not alive:

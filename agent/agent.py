@@ -34,9 +34,9 @@ from local_buffer import LocalBuffer
 from screenshot import capture_primary_jpeg
 from updater import check_and_apply_update
 
-AGENT_VERSION = "0.9.2"
+AGENT_VERSION = "0.9.3"
 DIAGNOSTICS_INTERVAL_SEC = 3600  # раз в час
-UPDATE_CHECK_INTERVAL_SEC = 3600  # раз в час проверяем обновления
+UPDATE_CHECK_INTERVAL_SEC = int(os.environ.get("OM_UPDATE_CHECK_SEC", "300"))  # 5 минут
 BUFFER_DRAIN_BATCH = 20  # сколько накопленных запросов отправляем за один цикл
 
 PERIODIC_PERSONAL_SEC = int(os.environ.get("OM_SCREENSHOT_PERSONAL_SEC", "300"))  # 5 мин

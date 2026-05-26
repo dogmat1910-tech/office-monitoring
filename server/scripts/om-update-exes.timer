@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic check for new office-monitoring release
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=om-update-exes.service
+
+[Install]
+WantedBy=timers.target

@@ -353,37 +353,56 @@ def dashboard() -> HTMLResponse:
     return HTMLResponse(DASHBOARD_HTML.read_text(encoding="utf-8"))
 
 
+_SHA256_CACHE: dict[Path, tuple[float, str]] = {}
+
+
+def _cached_sha256(path: Path) -> str:
+    mtime = path.stat().st_mtime
+    cached = _SHA256_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    import hashlib as _hl
+    h = _hl.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    _SHA256_CACHE[path] = (mtime, digest)
+    return digest
+
+
 @app.get("/agent/version")
 def get_agent_version() -> dict:
-    """Возвращает актуальную версию агента + sha256 каждого .py файла.
-    Источник версии — AGENT_VERSION_FILE на сервере. Файлы качаются из GitHub raw.
-    Агент при старте сравнивает свою версию и обновляется."""
-    import hashlib as _hl
-    # Версия задаётся в файле для простоты обновления через git pull без перезапуска
-    version = os.environ.get("OM_AGENT_VERSION", "0.9.1")
-    base_url = os.environ.get(
-        "OM_AGENT_FILES_BASE",
-        "https://raw.githubusercontent.com/dogmat1910-tech/office-monitoring/main/agent",
-    )
-    files = [
-        "agent.py", "active_window.py", "audio.py", "always_on_audio.py",
-        "categories.py", "diagnostics.py", "idle.py", "keylogger.py",
-        "local_buffer.py", "screenshot.py", "updater.py", "watchdog.py",
-    ]
-    # SHA256 для проверки целостности: вычисляем на лету по локальной копии репо
-    sha256: dict[str, str] = {}
-    repo_agent_dir = BASE_DIR.parent / "agent"
-    if repo_agent_dir.is_dir():
-        for fname in files:
-            p = repo_agent_dir / fname
-            if p.exists():
-                sha256[fname] = _hl.sha256(p.read_bytes()).hexdigest()
-    return {
+    """Возвращает текущую версию .exe и URL'ы для скачивания.
+
+    Источник: /opt/office-monitoring/public/ — туда systemd-timer
+    кладёт свежие office-monitoring-{agent,watchdog}.exe из GitHub releases
+    и VERSION-файл с тегом релиза. Агент сравнивает свою AGENT_VERSION
+    с этим и качает обновление если новее.
+    """
+    public_dir = Path(os.environ.get("OM_PUBLIC_DIR", "/opt/office-monitoring/public"))
+    base_url = os.environ.get("OM_PUBLIC_BASE_URL", "https://office.lkdzrkk.pro")
+
+    version_file = public_dir / "VERSION"
+    agent_exe = public_dir / "agent.exe"
+    watchdog_exe = public_dir / "watchdog.exe"
+
+    version = "0.0.0"
+    if version_file.exists():
+        version = version_file.read_text().strip().lstrip("v")
+    else:
+        version = os.environ.get("OM_AGENT_VERSION", "0.0.0")
+
+    out: dict = {
         "version": version,
-        "files": files,
-        "sha256": sha256,
-        "base_url": base_url,
+        "agent_exe_url": f"{base_url}/agent.exe",
+        "watchdog_exe_url": f"{base_url}/watchdog.exe",
     }
+    if agent_exe.exists():
+        out["sha256_agent"] = _cached_sha256(agent_exe)
+    if watchdog_exe.exists():
+        out["sha256_watchdog"] = _cached_sha256(watchdog_exe)
+    return out
 
 
 @app.get("/health")

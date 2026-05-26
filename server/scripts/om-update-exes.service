@@ -1,0 +1,8 @@
+[Unit]
+Description=Sync office-monitoring .exe with latest GitHub release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/office-monitoring/scripts/update-public-exes.sh
