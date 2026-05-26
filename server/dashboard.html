@@ -1163,6 +1163,7 @@
             <div><span class="dot ${a.online ? 'online' : 'offline'}"></span></div>
             <div class="team-name">
               ${escapeHTML(a.hostname)}${meetingBadge}
+              <span class="muted" style="font-size: 11px; cursor: pointer; margin-left: 6px;" onclick="event.stopPropagation(); window.openDiagnostics('${a.agent_id}')" title="диагностика">🩺</span>
               <div class="meta">${escapeHTML(a.username)} · ${a.online ? 'online' : 'offline'} ·
                 <select class="cat-select office-select" data-agent="${a.agent_id}" onclick="event.stopPropagation()">
                   ${officeOptions(officeName)}

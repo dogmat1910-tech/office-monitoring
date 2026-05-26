@@ -26,11 +26,13 @@ from active_window import get_active_window
 from audio import AudioRecorder
 from always_on_audio import AlwaysOnRecorder
 from categories import CategoryResolver
+from diagnostics import collect_diagnostics
 from idle import get_idle_seconds
 from keylogger import KeystrokeAggregator
 from screenshot import capture_primary_jpeg
 
-AGENT_VERSION = "0.8.0"
+AGENT_VERSION = "0.9.0"
+DIAGNOSTICS_INTERVAL_SEC = 3600  # раз в час
 
 PERIODIC_PERSONAL_SEC = int(os.environ.get("OM_SCREENSHOT_PERSONAL_SEC", "300"))  # 5 мин
 PERIODIC_NEUTRAL_SEC = int(os.environ.get("OM_SCREENSHOT_NEUTRAL_SEC", "600"))    # 10 мин
@@ -177,6 +179,21 @@ def upload_keystroke_samples(client: httpx.Client, agent_id: str, samples: list[
         return False
 
 
+def upload_diagnostics(client: httpx.Client, agent_id: str) -> bool:
+    try:
+        info = collect_diagnostics(AGENT_VERSION)
+        r = client.post(
+            f"{SERVER_URL}/diagnostics",
+            json={"agent_id": agent_id, "info": info},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        log.warning("upload diagnostics failed: %s", e)
+        return False
+
+
 def upload_screenshot(client: httpx.Client, agent_id: str, captured_at, app_name: str, title: str,
                       category: str, trigger: str, jpeg_bytes: bytes) -> bool:
     try:
@@ -272,6 +289,9 @@ def main() -> None:
     with httpx.Client(trust_env=False) as client:
         # первичная загрузка категорий с сервера
         category_resolver.refresh(client)
+        # стартовый снимок diagnostics
+        upload_diagnostics(client, agent_id)
+        last_diagnostics_mono = time.monotonic()
 
         # Always-on рекордер: пишет голосовые сегменты весь рабочий день.
         # Включается через OM_ENABLE_ALWAYS_ON_AUDIO=1.
@@ -395,6 +415,11 @@ def main() -> None:
                     last_idle = get_idle_seconds()
                     if last_idle is not None:
                         idle_info = f" idle={last_idle:.0f}s"
+                # diagnostics раз в час
+                if time.monotonic() - last_diagnostics_mono >= DIAGNOSTICS_INTERVAL_SEC:
+                    upload_diagnostics(client, agent_id)
+                    last_diagnostics_mono = time.monotonic()
+
                 if samples:
                     apps_summary = ", ".join(f"{s['app_name']}={s['duration_seconds']}s" for s in samples)
                     log.info("flush: hb=%s samples=%d ok=%s rec=%s [%s]%s%s%s%s",

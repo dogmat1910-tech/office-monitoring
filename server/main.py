@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy import func
@@ -140,6 +140,18 @@ class Screenshot(SQLModel, table=True):
     # OCR (заполняется воркером):
     ocr_text: str | None = None
     ocr_at: datetime | None = None
+
+
+class AgentDiagnostics(SQLModel, table=True):
+    """Self-report агента: версия, разрешения, доступные модули, состояние сети.
+    Перезаписываем при каждом приёме — храним только последний снимок на агента."""
+    id: int | None = Field(default=None, primary_key=True)
+    agent_id: str = Field(index=True, unique=True)
+    received_at: datetime
+    agent_version: str | None = None
+    python_version: str | None = None
+    platform: str | None = None
+    payload_json: str  # полный JSON со всеми деталями
 
 
 class IdleSample(SQLModel, table=True):
@@ -415,6 +427,54 @@ def post_window_samples(payload: WindowSamplesIn) -> dict[str, int | str]:
             ))
         session.commit()
     return {"status": "ok", "count": len(payload.samples)}
+
+
+@app.post("/diagnostics")
+async def post_diagnostics(request: Request) -> dict:
+    """Агент шлёт self-diagnostics при старте + раз в час."""
+    body = await request.json()
+    agent_id = body.get("agent_id")
+    if not agent_id:
+        raise HTTPException(400, "agent_id обязателен")
+    info = body.get("info", {})
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        existing = session.exec(select(AgentDiagnostics).where(AgentDiagnostics.agent_id == agent_id)).first()
+        payload = json.dumps(info, ensure_ascii=False)
+        if existing:
+            existing.received_at = now
+            existing.agent_version = info.get("agent_version")
+            existing.python_version = info.get("python_version")
+            existing.platform = info.get("platform")
+            existing.payload_json = payload
+            session.add(existing)
+        else:
+            session.add(AgentDiagnostics(
+                agent_id=agent_id,
+                received_at=now,
+                agent_version=info.get("agent_version"),
+                python_version=info.get("python_version"),
+                platform=info.get("platform"),
+                payload_json=payload,
+            ))
+        session.commit()
+    return {"status": "ok"}
+
+
+@app.get("/agents/{agent_id}/diagnostics")
+def get_diagnostics(agent_id: str) -> dict:
+    with Session(engine) as session:
+        d = session.exec(select(AgentDiagnostics).where(AgentDiagnostics.agent_id == agent_id)).first()
+        if d is None:
+            return {"agent_id": agent_id, "status": "no_diagnostics"}
+        return {
+            "agent_id": agent_id,
+            "received_at": _as_utc(d.received_at).isoformat(),
+            "agent_version": d.agent_version,
+            "python_version": d.python_version,
+            "platform": d.platform,
+            "info": json.loads(d.payload_json),
+        }
 
 
 @app.post("/idle_samples")

