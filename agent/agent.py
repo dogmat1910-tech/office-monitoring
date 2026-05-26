@@ -19,6 +19,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from pathlib import Path  # noqa: F811  # Path also used inside drain_buffer for blob path
 
 import httpx
 
@@ -29,10 +30,12 @@ from categories import CategoryResolver
 from diagnostics import collect_diagnostics
 from idle import get_idle_seconds
 from keylogger import KeystrokeAggregator
+from local_buffer import LocalBuffer
 from screenshot import capture_primary_jpeg
 
-AGENT_VERSION = "0.9.0"
+AGENT_VERSION = "0.9.1"
 DIAGNOSTICS_INTERVAL_SEC = 3600  # раз в час
+BUFFER_DRAIN_BATCH = 20  # сколько накопленных запросов отправляем за один цикл
 
 PERIODIC_PERSONAL_SEC = int(os.environ.get("OM_SCREENSHOT_PERSONAL_SEC", "300"))  # 5 мин
 PERIODIC_NEUTRAL_SEC = int(os.environ.get("OM_SCREENSHOT_NEUTRAL_SEC", "600"))    # 10 мин
@@ -87,7 +90,75 @@ class WindowBuffer:
         return result
 
 
+_buffer: LocalBuffer | None = None
+
+
+def get_buffer() -> LocalBuffer:
+    global _buffer
+    if _buffer is None:
+        _buffer = LocalBuffer()
+    return _buffer
+
+
+def send_with_buffer_json(client: httpx.Client, url: str, payload: dict, timeout: float = 10.0) -> bool:
+    """POST JSON. При ошибке сохраняем в локальный буфер для повторной отправки."""
+    try:
+        r = client.post(url, json=payload, timeout=timeout)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        log.warning("POST %s failed (буферизую): %s", url, e)
+        get_buffer().enqueue_json("POST", url, payload)
+        return False
+
+
+def send_with_buffer_multipart(client: httpx.Client, url: str, form: dict,
+                                file_bytes: bytes, filename: str, content_type: str,
+                                timeout: float = 60.0) -> bool:
+    try:
+        r = client.post(url, data=form, files={"file": (filename, file_bytes, content_type)}, timeout=timeout)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        log.warning("multipart POST %s failed (буферизую): %s", url, e)
+        get_buffer().enqueue_multipart(url, form, file_bytes, filename, content_type)
+        return False
+
+
+def drain_buffer(client: httpx.Client) -> tuple[int, int]:
+    """Пытается отправить накопленные запросы. Возвращает (отправлено, осталось)."""
+    buf = get_buffer()
+    items = buf.peek(BUFFER_DRAIN_BATCH)
+    sent = 0
+    for item in items:
+        try:
+            if item["kind"] == "json":
+                r = client.post(item["url"], json=item["data"], timeout=15.0)
+            else:
+                blob_path = item["blob_path"]
+                if not blob_path or not Path(blob_path).exists():
+                    buf.delete(item["id"])
+                    continue
+                file_bytes = Path(blob_path).read_bytes()
+                r = client.post(
+                    item["url"],
+                    data=item["data"],
+                    files={"file": (item["blob_filename"], file_bytes, item["blob_content_type"])},
+                    timeout=60.0,
+                )
+            r.raise_for_status()
+            buf.delete(item["id"])
+            sent += 1
+        except Exception as e:
+            buf.mark_error(item["id"], str(e))
+            # дальше не пробуем — скорее всего и следующие упадут
+            break
+    return sent, buf.size()
+
+
 def send_heartbeat(client: httpx.Client, agent_id: str, hostname: str, username: str) -> bool:
+    # heartbeat буферизовать смысла нет — он самый частый и устаревает мгновенно.
+    # Если сеть упала, шлём при восстановлении следующим тиком.
     try:
         r = client.post(
             f"{SERVER_URL}/heartbeat",
@@ -109,17 +180,10 @@ def send_heartbeat(client: httpx.Client, agent_id: str, hostname: str, username:
 def send_window_samples(client: httpx.Client, agent_id: str, samples: list[dict]) -> bool:
     if not samples:
         return True
-    try:
-        r = client.post(
-            f"{SERVER_URL}/window_samples",
-            json={"agent_id": agent_id, "samples": samples},
-            timeout=15.0,
-        )
-        r.raise_for_status()
-        return True
-    except Exception as e:
-        log.warning("window_samples failed (%d samples buffered): %s", len(samples), e)
-        return False
+    return send_with_buffer_json(
+        client, f"{SERVER_URL}/window_samples",
+        {"agent_id": agent_id, "samples": samples}, timeout=15.0,
+    )
 
 
 def get_active_meeting(client: httpx.Client, agent_id: str) -> dict | None:
@@ -150,33 +214,19 @@ def upload_audio_chunk(client: httpx.Client, meeting_id: int, chunk_index: int, 
 def upload_idle_samples(client: httpx.Client, agent_id: str, samples: list[dict]) -> bool:
     if not samples:
         return True
-    try:
-        r = client.post(
-            f"{SERVER_URL}/idle_samples",
-            json={"agent_id": agent_id, "samples": samples},
-            timeout=10.0,
-        )
-        r.raise_for_status()
-        return True
-    except Exception as e:
-        log.warning("idle_samples failed: %s", e)
-        return False
+    return send_with_buffer_json(
+        client, f"{SERVER_URL}/idle_samples",
+        {"agent_id": agent_id, "samples": samples},
+    )
 
 
 def upload_keystroke_samples(client: httpx.Client, agent_id: str, samples: list[dict]) -> bool:
     if not samples:
         return True
-    try:
-        r = client.post(
-            f"{SERVER_URL}/keystroke_samples",
-            json={"agent_id": agent_id, "samples": samples},
-            timeout=10.0,
-        )
-        r.raise_for_status()
-        return True
-    except Exception as e:
-        log.warning("keystroke_samples failed: %s", e)
-        return False
+    return send_with_buffer_json(
+        client, f"{SERVER_URL}/keystroke_samples",
+        {"agent_id": agent_id, "samples": samples},
+    )
 
 
 def upload_diagnostics(client: httpx.Client, agent_id: str) -> bool:
@@ -196,44 +246,36 @@ def upload_diagnostics(client: httpx.Client, agent_id: str) -> bool:
 
 def upload_screenshot(client: httpx.Client, agent_id: str, captured_at, app_name: str, title: str,
                       category: str, trigger: str, jpeg_bytes: bytes) -> bool:
-    try:
-        r = client.post(
-            f"{SERVER_URL}/screenshots",
-            data={
-                "agent_id": agent_id,
-                "captured_at": captured_at.isoformat(),
-                "app_name": app_name or "",
-                "title": title or "",
-                "category": category or "",
-                "trigger": trigger or "",
-            },
-            files={"file": ("screenshot.jpg", jpeg_bytes, "image/jpeg")},
-            timeout=30.0,
-        )
-        r.raise_for_status()
-        return True
-    except Exception as e:
-        log.warning("upload screenshot failed: %s", e)
-        return False
+    return send_with_buffer_multipart(
+        client, f"{SERVER_URL}/screenshots",
+        form={
+            "agent_id": agent_id,
+            "captured_at": captured_at.isoformat(),
+            "app_name": app_name or "",
+            "title": title or "",
+            "category": category or "",
+            "trigger": trigger or "",
+        },
+        file_bytes=jpeg_bytes,
+        filename="screenshot.jpg",
+        content_type="image/jpeg",
+        timeout=30.0,
+    )
 
 
 def upload_voice_segment(client: httpx.Client, agent_id: str, started_at, ended_at, opus_bytes: bytes) -> bool:
-    try:
-        r = client.post(
-            f"{SERVER_URL}/voice_segments",
-            data={
-                "agent_id": agent_id,
-                "started_at": started_at.isoformat(),
-                "ended_at": ended_at.isoformat(),
-            },
-            files={"file": (f"seg.opus", opus_bytes, "audio/ogg")},
-            timeout=60.0,
-        )
-        r.raise_for_status()
-        return True
-    except Exception as e:
-        log.warning("upload voice segment failed: %s", e)
-        return False
+    return send_with_buffer_multipart(
+        client, f"{SERVER_URL}/voice_segments",
+        form={
+            "agent_id": agent_id,
+            "started_at": started_at.isoformat(),
+            "ended_at": ended_at.isoformat(),
+        },
+        file_bytes=opus_bytes,
+        filename="seg.opus",
+        content_type="audio/ogg",
+        timeout=60.0,
+    )
 
 
 def main() -> None:
@@ -415,6 +457,12 @@ def main() -> None:
                     last_idle = get_idle_seconds()
                     if last_idle is not None:
                         idle_info = f" idle={last_idle:.0f}s"
+                # drain буфера: пытаемся отправить накопленное при отвале сети
+                drained, pending = drain_buffer(client)
+                buf_info = f" buf={pending}" if pending or drained else ""
+                if drained:
+                    log.info("buffer drained: %d sent, %d pending", drained, pending)
+
                 # diagnostics раз в час
                 if time.monotonic() - last_diagnostics_mono >= DIAGNOSTICS_INTERVAL_SEC:
                     upload_diagnostics(client, agent_id)
@@ -422,11 +470,11 @@ def main() -> None:
 
                 if samples:
                     apps_summary = ", ".join(f"{s['app_name']}={s['duration_seconds']}s" for s in samples)
-                    log.info("flush: hb=%s samples=%d ok=%s rec=%s [%s]%s%s%s%s",
-                             ok_hb, len(samples), ok_ws, recorder.is_recording(), apps_summary, audio_info, ao_info, ks_info, idle_info)
+                    log.info("flush: hb=%s samples=%d ok=%s rec=%s [%s]%s%s%s%s%s",
+                             ok_hb, len(samples), ok_ws, recorder.is_recording(), apps_summary, audio_info, ao_info, ks_info, idle_info, buf_info)
                 else:
-                    log.info("flush: hb=%s samples=0 ok=%s rec=%s%s%s%s%s",
-                             ok_hb, ok_ws, recorder.is_recording(), audio_info, ao_info, ks_info, idle_info)
+                    log.info("flush: hb=%s samples=0 ok=%s rec=%s%s%s%s%s%s",
+                             ok_hb, ok_ws, recorder.is_recording(), audio_info, ao_info, ks_info, idle_info, buf_info)
                 last_flush = now
 
             time.sleep(SAMPLE_INTERVAL)
