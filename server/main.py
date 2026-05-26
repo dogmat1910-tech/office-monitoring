@@ -1,5 +1,7 @@
+import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -134,6 +136,8 @@ class AppCategory(SQLModel, table=True):
     app_name: str = Field(index=True, unique=True)
     category: str  # work | personal | neutral
     updated_at: datetime
+    auto_categorized: bool = False  # True если LLM определил
+    confidence: float | None = None  # 0..1, оценка уверенности LLM
 
 
 class DomainCategory(SQLModel, table=True):
@@ -142,6 +146,8 @@ class DomainCategory(SQLModel, table=True):
     domain: str = Field(index=True, unique=True)
     category: str  # work | personal | neutral
     updated_at: datetime
+    auto_categorized: bool = False
+    confidence: float | None = None
 
 
 class Screenshot(SQLModel, table=True):
@@ -376,9 +382,34 @@ async def agent_auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+_AUTO_CATEGORIZE_INTERVAL = int(os.environ.get("OM_AUTO_CATEGORIZE_INTERVAL", "900"))  # 15 минут
+
+
+async def _auto_categorize_loop() -> None:
+    """Периодически прогоняет LLM-категоризацию для новых app/domain."""
+    import auto_categorize as ac
+    loop = asyncio.get_running_loop()
+    # Небольшая задержка перед первым прогоном, чтобы дать API подняться
+    await asyncio.sleep(30)
+    while True:
+        try:
+            result = await loop.run_in_executor(None, ac.run_once, engine)
+            if result["apps_added"] or result["domains_added"]:
+                logging.getLogger("main").info(
+                    "auto-categorize: %d apps + %d domains добавлено",
+                    result["apps_added"], result["domains_added"],
+                )
+        except Exception as e:
+            logging.getLogger("main").warning("auto-categorize loop error: %s", e)
+        await asyncio.sleep(_AUTO_CATEGORIZE_INTERVAL)
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     SQLModel.metadata.create_all(engine)
+    # Background task для LLM-категоризации — запускаем только если ключ OpenRouter есть
+    if os.environ.get("OM_OPENROUTER_API_KEY"):
+        asyncio.create_task(_auto_categorize_loop())
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -1061,19 +1092,38 @@ def set_app_category(payload: CategoryIn) -> dict:
             if existing:
                 existing.category = payload.category
                 existing.updated_at = now
+                existing.auto_categorized = False  # админ переопределил, LLM больше не трогает
+                existing.confidence = None
                 session.add(existing)
             else:
-                session.add(DomainCategory(domain=payload.name, category=payload.category, updated_at=now))
+                session.add(DomainCategory(
+                    domain=payload.name, category=payload.category,
+                    updated_at=now, auto_categorized=False,
+                ))
         else:
             existing = session.exec(select(AppCategory).where(AppCategory.app_name == payload.name)).first()
             if existing:
                 existing.category = payload.category
                 existing.updated_at = now
+                existing.auto_categorized = False
+                existing.confidence = None
                 session.add(existing)
             else:
-                session.add(AppCategory(app_name=payload.name, category=payload.category, updated_at=now))
+                session.add(AppCategory(
+                    app_name=payload.name, category=payload.category,
+                    updated_at=now, auto_categorized=False,
+                ))
         session.commit()
     return {"status": "ok", "kind": payload.kind, "name": payload.name, "category": payload.category}
+
+
+@app.post("/admin/recategorize")
+def admin_recategorize(lookback_days: int = 7) -> dict:
+    """Запускает LLM-категоризацию приложений и доменов, у которых пока нет категории."""
+    import auto_categorize as ac
+    apps_added = ac.categorize_new_apps(engine, lookback_days=lookback_days)
+    domains_added = ac.categorize_new_domains(engine, lookback_days=lookback_days)
+    return {"apps_added": apps_added, "domains_added": domains_added}
 
 
 @app.get("/agents/{agent_id}/day_summary")
