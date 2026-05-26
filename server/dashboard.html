@@ -1343,6 +1343,7 @@
           ${pr.idle_seconds ? `<div class="daily-meta">бездействие (отошёл от компа): ${fmtSec(pr.idle_seconds)}</div>` : ""}
           ${(pr.top_distractions || []).length ? `<ul>${pr.top_distractions.map(x => `<li>${escapeHTML(x.name)}: ${fmtSec(x.seconds || 0)}</li>`).join("")}</ul>` : '<div class="daily-meta">личного не зафиксировано</div>'}
           ${pr.keystroke_distribution ? `<div class="daily-meta" style="margin-top:8px;"><strong>⌨ Клавиатура:</strong> ${escapeHTML(pr.keystroke_distribution)}</div>` : ""}
+          ${pr.ocr_findings ? `<div class="daily-meta" style="margin-top:8px;"><strong>📸 На экране:</strong> ${escapeHTML(pr.ocr_findings)}</div>` : ""}
           ${(pr.observations || []).length ? `<div class="daily-meta" style="margin-top:8px;"><strong>Наблюдения:</strong></div><ul>${pr.observations.map(x => `<li>${escapeHTML(x)}</li>`).join("")}</ul>` : ""}
         </div>`;
 

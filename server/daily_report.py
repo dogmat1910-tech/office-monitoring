@@ -24,7 +24,7 @@ from sqlmodel import Session, select
 
 from main import (
     AppCategory, DailyReport, DomainCategory, IdleSample, KeystrokeSample,
-    Meeting, Analysis, Transcript, VoiceSegment, WindowSample, engine,
+    Meeting, Analysis, Screenshot, Transcript, VoiceSegment, WindowSample, engine,
     DEFAULT_CATEGORIES, DEFAULT_DOMAIN_CATEGORIES, BROWSER_APPS,
     extract_url_from_title, extract_domain, _as_utc,
 )
@@ -142,6 +142,32 @@ def collect_day_data(agent_id: str, report_date: str) -> dict:
         idle_seconds = sum(r.interval_seconds for r in idle_rows if r.idle_seconds > idle_threshold)
         active_at_pc_seconds = total_idle_interval - idle_seconds
 
+        # Screenshots + OCR: сколько раз срабатывал триггер «зашёл на personal/neutral»
+        # и краткие фрагменты текста с этих экранов
+        screenshots = session.exec(
+            select(Screenshot)
+            .where(Screenshot.agent_id == agent_id)
+            .where(Screenshot.captured_at >= start)
+            .where(Screenshot.captured_at < end)
+            .order_by(Screenshot.captured_at)
+        ).all()
+        screenshots_count = len(screenshots)
+        screenshots_by_category: dict[str, int] = {}
+        ocr_excerpts: list[dict] = []
+        for s in screenshots:
+            cat = s.category or "neutral"
+            screenshots_by_category[cat] = screenshots_by_category.get(cat, 0) + 1
+            # Берём только осмысленный OCR-текст (>15 символов, не служебные)
+            txt = (s.ocr_text or "").strip()
+            if len(txt) > 15:
+                ocr_excerpts.append({
+                    "time": _as_utc(s.captured_at).isoformat(),
+                    "app_name": s.app_name,
+                    "title": s.title,
+                    "category": cat,
+                    "ocr": txt[:400],  # ограничиваем длину
+                })
+
         # Keystrokes: сколько и где набирал
         ks_rows = session.exec(
             select(KeystrokeSample.app_name, func.sum(KeystrokeSample.keystroke_count))
@@ -196,6 +222,9 @@ def collect_day_data(agent_id: str, report_date: str) -> dict:
             "idle_seconds": idle_seconds,
             "keystrokes_total": keystrokes_total,
             "keystrokes_by_app": keystrokes_by_app[:15],
+            "screenshots_count": screenshots_count,
+            "screenshots_by_category": screenshots_by_category,
+            "ocr_excerpts": ocr_excerpts[:30],  # для промпта максимум 30 фрагментов
         }
 
 
@@ -242,6 +271,12 @@ def build_user_prompt(data: dict) -> str:
         for k in data.get("keystrokes_by_app", [])[:10]
     ) or "  (нет данных по клавиатуре)"
 
+    ocr_text = "\n".join(
+        f"  [{e['time'][11:19]} {e['app_name']} · {e['category']}] {e['ocr'][:200]}"
+        for e in data.get("ocr_excerpts", [])[:20]
+    ) or "  (скриншотов с текстом нет)"
+    screenshots_by_cat = data.get("screenshots_by_category", {})
+
     by_cat = data["by_category"]
 
     return f"""\
@@ -262,6 +297,11 @@ def build_user_prompt(data: dict) -> str:
   всего нажатий: {data.get('keystrokes_total', 0)} знаков
   по приложениям (топ-10):
 {keystrokes_text}
+
+СКРИНШОТЫ (срабатывают при заходе в personal/neutral окна):
+  всего за день: {data.get('screenshots_count', 0)} — personal: {screenshots_by_cat.get('personal', 0)}, neutral: {screenshots_by_cat.get('neutral', 0)}
+  Фрагменты OCR-текста с экранов (что менеджер видел вне рабочего контекста):
+{ocr_text}
 
 ТОП приложений и сайтов:
 {apps_text}
@@ -299,6 +339,7 @@ def build_user_prompt(data: dict) -> str:
     "top_distractions": [{{"name": "<сайт/прилож>", "seconds": <число>}}, ...],
     "idle_seconds": <число секунд бездействия — отходил от компа>,
     "keystroke_distribution": "<2-3 предложения: где менеджер набирал текст. Например: 'Из 4200 знаков 2800 в AmoCRM (работа) и 1200 в Telegram (личное) — половина клавиатурной активности на личное'>",
+    "ocr_findings": "<2-3 предложения: КОНКРЕТНО что менеджер смотрел/читал в нерабочих окнах согласно OCR. Если данных нет — пиши 'данных по содержимому экрана нет'>",
     "observations": ["<наблюдение>", ...]
   }},
   "productivity_score": <число 0-10>,
@@ -317,6 +358,12 @@ productivity_score:
 - idle_seconds большой (>2 ч в день) = менеджер часто отходит от компа
 - много keystrokes в личных приложениях (Telegram, ВКонтакте) = личная переписка
 - мало keystrokes в work-приложениях + мало встреч = бездействие за компом
+- OCR-текст со скриншотов personal-окон даёт КОНКРЕТИКУ что смотрел/читал:
+  название видео на YouTube, заголовки статей, темы в ленте ВК.
+  Используй цитаты в observations: «менеджер смотрел "<название>"»
+
+procrastination.ocr_findings: 2-3 предложения о КОНКРЕТНЫХ материалах
+которые менеджер смотрел/читал в нерабочих окнах (из OCR-текста).
 """
 
 
