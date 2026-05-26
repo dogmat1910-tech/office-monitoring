@@ -1227,6 +1227,56 @@
       }));
     }
 
+    // ───────────── Диагностика агента (модалка) ─────────────
+    window.openDiagnostics = async function(agentId) {
+      const r = await fetch(`/agents/${agentId}/diagnostics`);
+      const d = await r.json();
+      const modal = document.getElementById("officeModal");
+      const inner = modal.querySelector("div");
+      if (d.status === "no_diagnostics") {
+        inner.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+            <h2 style="margin:0;">🩺 Диагностика ${escapeHTML(agentId)}</h2>
+            <span style="cursor:pointer;font-size:24px;" onclick="document.getElementById('officeModal').classList.remove('open')">&times;</span>
+          </div>
+          <div class="empty">агент ещё не присылал диагностику (нужна версия 0.9.0+)</div>`;
+      } else {
+        const i = d.info || {};
+        const mods = i.modules || {};
+        const perms = i.permissions || {};
+        const proc = i.process || {};
+        const disk = i.disk || {};
+        const okMark = (b) => b ? '<span style="color:#4ade80">✓</span>' : '<span style="color:#f87171">✗</span>';
+        const permMark = (p) => p === "granted" ? '<span style="color:#4ade80">✓</span>' : (p === "denied" ? '<span style="color:#f87171">✗</span>' : '<span class="muted">?</span>');
+        const modules_html = Object.entries(mods).map(([k, v]) => `<div>${okMark(v)} ${escapeHTML(k)}</div>`).join("");
+        const perms_html = Object.entries(perms).map(([k, v]) => `<div>${permMark(v)} ${escapeHTML(k.replace("_", " "))}</div>`).join("") || '<div class="muted">(только на Mac)</div>';
+        inner.innerHTML = `
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+            <h2 style="margin:0;">🩺 Диагностика ${escapeHTML(d.agent_id)}</h2>
+            <span style="cursor:pointer;font-size:24px;" onclick="document.getElementById('officeModal').classList.remove('open')">&times;</span>
+          </div>
+          <div class="daily-meta">обновлено ${fmtDateTime(d.received_at)}</div>
+          <div class="twocol" style="margin-top:14px;">
+            <div>
+              <h4>Окружение</h4>
+              <div>📦 версия агента: <strong>${escapeHTML(d.agent_version || '?')}</strong></div>
+              <div>🐍 Python: ${escapeHTML(d.python_version || '?')}</div>
+              <div>💻 OS: ${escapeHTML(i.platform_full || d.platform || '?')}</div>
+              <div>📍 hostname: ${escapeHTML(i.hostname || '?')}</div>
+              ${proc.rss_mb ? `<div>🧠 память: ${proc.rss_mb} MB · CPU ${proc.cpu_percent}%</div>` : ''}
+              ${disk.free_gb ? `<div>💾 диск: ${disk.free_gb} GB свободно</div>` : ''}
+              ${i.server_reachable !== undefined ? `<div>🌐 сервер: ${i.server_reachable ? '✓ доступен' : '✗ недоступен'}</div>` : ''}
+            </div>
+            <div>
+              <h4>Разрешения (macOS)</h4>
+              ${perms_html}
+              <h4 style="margin-top:14px;">Модули Python</h4>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:0 12px;">${modules_html}</div>
+            </div>
+          </div>`;
+      }
+      modal.classList.add("open");
+    };
+
     // ───────────── Управление офисами (модалка) ─────────────
     async function renderOfficeManager() {
       await loadOffices();
