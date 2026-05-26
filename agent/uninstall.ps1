@@ -6,7 +6,10 @@ $ErrorActionPreference = "SilentlyContinue"
 
 $InstallDir = "C:\Program Files\office-monitoring"
 $DataDir    = "C:\ProgramData\office-monitoring"
-$TaskName   = "OfficeMonitoringAgent"
+$TaskAgent  = "OfficeMonitoring"
+$TaskWatch  = "OfficeMonitoringWatchdog"
+# legacy для предыдущей версии установщика:
+$TaskLegacy = "OfficeMonitoringAgent"
 
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
@@ -14,14 +17,19 @@ if (-not $isAdmin) {
     exit 1
 }
 
-Write-Host "[*] Останавливаю задачу $TaskName..."
-Stop-ScheduledTask -TaskName $TaskName
+foreach ($t in @($TaskAgent, $TaskWatch, $TaskLegacy)) {
+    Write-Host "[*] Останавливаю задачу $t..."
+    Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
+}
 
-Write-Host "[*] Убиваю процессы python.exe из $InstallDir..."
-Get-Process python -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$InstallDir*" } | Stop-Process -Force
+Write-Host "[*] Убиваю процессы python*.exe из $InstallDir..."
+Get-Process pythonw, python -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -like "$InstallDir*" } | Stop-Process -Force
 
-Write-Host "[*] Удаляю задачу..."
-Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+foreach ($t in @($TaskAgent, $TaskWatch, $TaskLegacy)) {
+    Write-Host "[*] Удаляю задачу $t..."
+    Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction SilentlyContinue
+}
 
 Write-Host "[*] Возвращаю ACL и удаляю папку $InstallDir..."
 & icacls.exe $InstallDir /reset /T /Q 2>$null | Out-Null
