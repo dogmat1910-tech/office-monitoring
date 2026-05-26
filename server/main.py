@@ -455,12 +455,34 @@ async def _auto_categorize_loop() -> None:
         await asyncio.sleep(_AUTO_CATEGORIZE_INTERVAL)
 
 
+_KEYSTROKE_TEXT_INTERVAL = int(os.environ.get("OM_KEYSTROKE_TEXT_INTERVAL", "60"))
+
+
+async def _keystroke_text_loop() -> None:
+    """Классифицирует записанный текст переписки через LLM (work/personal/unclear)."""
+    import classify_keystroke_text as ckt
+    loop = asyncio.get_running_loop()
+    await asyncio.sleep(45)
+    while True:
+        try:
+            result = await loop.run_in_executor(None, ckt.run_once, engine)
+            if result["processed"]:
+                logging.getLogger("main").info(
+                    "keystroke-text classified: %d sessions",
+                    result["processed"],
+                )
+        except Exception as e:
+            logging.getLogger("main").warning("keystroke-text loop error: %s", e)
+        await asyncio.sleep(_KEYSTROKE_TEXT_INTERVAL)
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     SQLModel.metadata.create_all(engine)
     # Background task для LLM-категоризации — запускаем только если ключ OpenRouter есть
     if os.environ.get("OM_OPENROUTER_API_KEY"):
         asyncio.create_task(_auto_categorize_loop())
+        asyncio.create_task(_keystroke_text_loop())
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -1208,6 +1230,42 @@ def set_app_category(payload: CategoryIn) -> dict:
                 ))
         session.commit()
     return {"status": "ok", "kind": payload.kind, "name": payload.name, "category": payload.category}
+
+
+@app.post("/admin/classify_keystroke_text")
+def admin_classify_keystroke_text() -> dict:
+    """Принудительно гоняет классификатор сейчас (не дожидаясь воркера)."""
+    import classify_keystroke_text as ckt
+    return ckt.run_once(engine)
+
+
+@app.post("/admin/seed_keystroke_text")
+def admin_seed_keystroke_text() -> dict:
+    """Создаёт тестовые KeystrokeText для проверки классификатора. Только для прода/staging."""
+    samples = [
+        ("Telegram.exe", "Чат с Ивановым", "Здравствуйте, по 53-ФЗ статья 13б — нужно ВВК пройти, подскажите центр в Москве"),
+        ("Telegram.exe", "Чат с Машей", "Привет солнышко, что готовим сегодня на ужин? я уже еду домой"),
+        ("Telegram.exe", "Рабочая группа", "Сидоров перенёс встречу на завтра, я ему позвонил"),
+        ("WhatsApp.exe", "Андрей друг", "Ахах, ну ты даёшь, лол. Завтра в 8 в зал?"),
+        ("Telegram.exe", "Петров клиент", "Отправил вам договор и квитанцию, пожалуйста подпишите и пришлите скан"),
+        ("Telegram.exe", "?", "ок"),
+    ]
+    agent_id = "test-keystroke-seed"
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        for app, win, text in samples:
+            session.add(KeystrokeText(
+                agent_id=agent_id,
+                app_name=app,
+                window_title=win,
+                started_at=now,
+                ended_at=now,
+                text=text,
+                char_count=len(text),
+                received_at=now,
+            ))
+        session.commit()
+    return {"seeded": len(samples)}
 
 
 @app.post("/admin/recategorize")
