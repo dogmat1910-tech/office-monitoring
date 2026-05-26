@@ -353,6 +353,39 @@ def dashboard() -> HTMLResponse:
     return HTMLResponse(DASHBOARD_HTML.read_text(encoding="utf-8"))
 
 
+@app.get("/agent/version")
+def get_agent_version() -> dict:
+    """Возвращает актуальную версию агента + sha256 каждого .py файла.
+    Источник версии — AGENT_VERSION_FILE на сервере. Файлы качаются из GitHub raw.
+    Агент при старте сравнивает свою версию и обновляется."""
+    import hashlib as _hl
+    # Версия задаётся в файле для простоты обновления через git pull без перезапуска
+    version = os.environ.get("OM_AGENT_VERSION", "0.9.1")
+    base_url = os.environ.get(
+        "OM_AGENT_FILES_BASE",
+        "https://raw.githubusercontent.com/dogmat1910-tech/office-monitoring/main/agent",
+    )
+    files = [
+        "agent.py", "active_window.py", "audio.py", "always_on_audio.py",
+        "categories.py", "diagnostics.py", "idle.py", "keylogger.py",
+        "local_buffer.py", "screenshot.py", "updater.py", "watchdog.py",
+    ]
+    # SHA256 для проверки целостности: вычисляем на лету по локальной копии репо
+    sha256: dict[str, str] = {}
+    repo_agent_dir = BASE_DIR.parent / "agent"
+    if repo_agent_dir.is_dir():
+        for fname in files:
+            p = repo_agent_dir / fname
+            if p.exists():
+                sha256[fname] = _hl.sha256(p.read_bytes()).hexdigest()
+    return {
+        "version": version,
+        "files": files,
+        "sha256": sha256,
+        "base_url": base_url,
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, str | bool]:
     return {"status": "ok", "api_token_configured": bool(API_TOKEN)}
