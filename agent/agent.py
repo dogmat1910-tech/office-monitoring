@@ -34,7 +34,7 @@ from local_buffer import LocalBuffer
 from screenshot import capture_primary_jpeg
 from updater import check_and_apply_update
 
-AGENT_VERSION = "0.9.1"
+AGENT_VERSION = "0.9.2"
 DIAGNOSTICS_INTERVAL_SEC = 3600  # раз в час
 UPDATE_CHECK_INTERVAL_SEC = 3600  # раз в час проверяем обновления
 BUFFER_DRAIN_BATCH = 20  # сколько накопленных запросов отправляем за один цикл
@@ -280,7 +280,47 @@ def upload_voice_segment(client: httpx.Client, agent_id: str, started_at, ended_
     )
 
 
+def _ensure_single_instance() -> None:
+    """Если уже запущен другой agent.exe (по PID-файлу или поиску процесса) — выходим.
+
+    Защита от случая, когда при логине срабатывают одновременно Scheduled Task
+    агента и watchdog: оба могут попытаться запустить агента.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return  # psutil не установлен — пропускаем проверку, не блокируем запуск
+
+    my_pid = os.getpid()
+    my_name = Path(sys.executable).name.lower()
+    # При запуске из .exe — sys.executable == office-monitoring-agent.exe.
+    # При запуске из python — это python.exe (dev-режим), не плодим дубли в проде.
+    if not my_name.startswith("office-monitoring-agent"):
+        return
+
+    pid_file = LOG_DIR / "agent.pid"
+    if pid_file.exists():
+        try:
+            old_pid = int(pid_file.read_text().strip())
+            if old_pid != my_pid and psutil.pid_exists(old_pid):
+                try:
+                    p = psutil.Process(old_pid)
+                    if p.name().lower() == my_name:
+                        log.warning("another agent already running (pid=%s), exiting", old_pid)
+                        sys.exit(0)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except (ValueError, OSError):
+            pass
+    try:
+        pid_file.write_text(str(my_pid))
+    except OSError as e:
+        log.warning("failed to write pid-file: %s", e)
+
+
 def main() -> None:
+    _ensure_single_instance()
+
     hostname = socket.gethostname()
     username = getpass.getuser()
     agent_id = make_agent_id(hostname, username)
