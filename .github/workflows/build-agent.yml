@@ -46,11 +46,12 @@ jobs:
           pyinstaller --onefile `
             --name office-monitoring-agent `
             --noconsole `
+            --additional-hooks-dir=pyinstaller_hooks `
             --hidden-import=pynput.keyboard._win32 `
             --hidden-import=pynput.mouse._win32 `
             --hidden-import=win32gui `
             --hidden-import=win32process `
-            --collect-all=webrtcvad `
+            --hidden-import=webrtcvad `
             --collect-all=soundfile `
             --collect-all=sounddevice `
             --collect-all=mss `
