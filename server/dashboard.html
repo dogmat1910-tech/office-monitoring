@@ -390,7 +390,10 @@
   <header>
     <h1>office-monitoring</h1>
     <div class="controls">
-      <label class="muted">период:
+      <button class="btn-sim" id="dateToday" data-shift="0" style="padding: 6px 10px; font-size: 12px;">Сегодня</button>
+      <button class="btn-sim" id="dateYesterday" data-shift="-1" style="padding: 6px 10px; font-size: 12px; background: #475569;">Вчера</button>
+      <input type="date" id="datePicker" style="background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 13px;">
+      <label class="muted" id="hoursLabel">период:
         <select id="hours">
           <option value="1">1 час</option>
           <option value="8" selected>8 часов</option>
@@ -581,6 +584,8 @@
     let selectedAgent = null;
     let activeTab = localStorage.getItem("omTab") || "today";
     let expandedMeetingId = null;
+    // режим времени: либо date=YYYY-MM-DD (за конкретный день), либо null (за последние hours)
+    let selectedDate = null;
     // Декларации ниже подняты сюда, чтобы applyTab() при инициализации
     // мог их безопасно использовать (TDZ-safe).
     let teamData = null;
@@ -680,18 +685,24 @@
     }
 
     // ───────────── Загрузка данных агента ─────────────
+    function rangeQuery() {
+      // Возвращает query-string '?hours=N' или '?date=YYYY-MM-DD'
+      if (selectedDate) return `date=${selectedDate}`;
+      return `hours=${$("#hours").value}`;
+    }
+
     async function loadAgentData() {
       if (!selectedAgent) return;
-      const hours = $("#hours").value;
+      const rq = rangeQuery();
       const [daySummaryR, windowsR, meetingsR, voiceR, activityR, convListR, convSumR, scrR] = await Promise.all([
-        fetch(`/agents/${selectedAgent}/day_summary?hours=${hours}`),
+        fetch(`/agents/${selectedAgent}/day_summary?${rq}`),
         fetch(`/agents/${selectedAgent}/windows?limit=50`),
         fetch(`/meetings?agent_id=${selectedAgent}&limit=20`),
-        fetch(`/agents/${selectedAgent}/voice_segments?hours=${hours}&limit=100`),
-        fetch(`/agents/${selectedAgent}/activity_summary?hours=${hours}`),
-        fetch(`/agents/${selectedAgent}/conversations?hours=${hours}&limit=50`),
-        fetch(`/agents/${selectedAgent}/conversations_summary?hours=${hours}`),
-        fetch(`/agents/${selectedAgent}/screenshots?hours=${hours}&limit=100`),
+        fetch(`/agents/${selectedAgent}/voice_segments?${rq}&limit=100`),
+        fetch(`/agents/${selectedAgent}/activity_summary?${rq}`),
+        fetch(`/agents/${selectedAgent}/conversations?${rq}&limit=50`),
+        fetch(`/agents/${selectedAgent}/conversations_summary?${rq}`),
+        fetch(`/agents/${selectedAgent}/screenshots?${rq}&limit=100`),
       ]);
       const daySummary = await daySummaryR.json();
       const windows = await windowsR.json();
@@ -712,7 +723,8 @@
       renderWindows(windows);
       renderConversations(conversations, convSum);
       renderScreenshots(screenshots);
-      $("#updated").textContent = "обновлено " + fmtDateTime(new Date().toISOString());
+      const scope = selectedDate ? `за ${selectedDate}` : `последние ${$("#hours").value} ч`;
+      $("#updated").textContent = `${scope} · обновлено ${fmtDateTime(new Date().toISOString())}`;
     }
 
     function renderScreenshots(items) {
@@ -1041,10 +1053,9 @@
 
     // ───────────── Tab: Команда (overview всех агентов) ─────────────
     async function loadTeam() {
-      const hours = $("#hours").value;
       try {
         const [overR, _offices] = await Promise.all([
-          fetch(`/overview?hours=${hours}`),
+          fetch(`/overview?${rangeQuery()}`),
           loadOffices(),
         ]);
         teamData = await overR.json();
@@ -1427,8 +1438,57 @@
     if (savedToken) $("#apiToken").value = savedToken;
     $("#apiToken").addEventListener("change", () => localStorage.setItem("omToken", $("#apiToken").value.trim()));
 
-    $("#refresh").addEventListener("click", () => { loadAgents(); loadAgentData(); });
-    $("#hours").addEventListener("change", loadAgentData);
+    $("#refresh").addEventListener("click", () => { loadAgents(); loadAgentData(); if (activeTab === "team") loadTeam(); });
+
+    function todayISO() {
+      const d = new Date();
+      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+    }
+    function shiftedISO(days) {
+      const d = new Date();
+      d.setDate(d.getDate() + days);
+      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+    }
+
+    function applyDateMode() {
+      // подсвечиваем активную кнопку, скрываем/показываем селектор hours
+      const isToday = !selectedDate || selectedDate === todayISO();
+      const isYesterday = selectedDate === shiftedISO(-1);
+      $("#dateToday").style.background = (isToday && !selectedDate) ? "#b45309" : "#475569";
+      $("#dateYesterday").style.background = isYesterday ? "#b45309" : "#475569";
+      $("#hoursLabel").style.display = selectedDate ? "none" : "";
+      // обновляем дата-пикер
+      $("#datePicker").value = selectedDate || "";
+    }
+
+    $("#dateToday").addEventListener("click", () => {
+      selectedDate = null;
+      applyDateMode();
+      loadAgentData();
+      if (activeTab === "team") loadTeam();
+    });
+    $("#dateYesterday").addEventListener("click", () => {
+      selectedDate = shiftedISO(-1);
+      applyDateMode();
+      loadAgentData();
+      if (activeTab === "team") loadTeam();
+    });
+    $("#datePicker").addEventListener("change", () => {
+      const v = $("#datePicker").value;
+      selectedDate = v || null;
+      // если выбрали сегодня — переключаемся в режим hours
+      if (selectedDate === todayISO()) selectedDate = null;
+      applyDateMode();
+      loadAgentData();
+      if (activeTab === "team") loadTeam();
+    });
+
+    $("#hours").addEventListener("change", () => {
+      loadAgentData();
+      if (activeTab === "team") loadTeam();
+    });
+
+    applyDateMode();
 
     loadAgents();
     setInterval(() => {

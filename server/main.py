@@ -305,6 +305,26 @@ def _as_utc(dt: datetime) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+# Локальный таймзон сервера: для прода вынести в env или брать из Office.timezone
+LOCAL_TZ_OFFSET = timedelta(hours=3)  # UTC+3 (Москва)
+
+
+def _time_range(date: str | None, hours: int) -> tuple[datetime, datetime]:
+    """Возвращает [start, end) в UTC.
+    - date=YYYY-MM-DD: весь день этой даты (00:00 - 24:00 локального времени)
+    - date=None: последние hours часов от сейчас."""
+    if date:
+        try:
+            d = datetime.fromisoformat(date)
+        except ValueError:
+            raise HTTPException(400, f"date должен быть YYYY-MM-DD, получено {date!r}")
+        start = (d - LOCAL_TZ_OFFSET).replace(tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        return start, end
+    now = datetime.now(timezone.utc)
+    return now - timedelta(hours=hours), now
+
+
 def require_token(authorization: str | None = Header(default=None)) -> None:
     """Проверка Bearer-токена для приватных эндпоинтов."""
     if not API_TOKEN:
@@ -430,16 +450,16 @@ def post_keystroke_samples(payload: KeystrokeSamplesIn) -> dict:
 
 
 @app.get("/agents/{agent_id}/activity_summary")
-def agent_activity_summary(agent_id: str, hours: int = 24, idle_threshold: int = 60) -> dict:
-    """Сводка по бездействию и набору символов за период.
-    idle_threshold — порог idle_seconds, выше которого считаем «не за компом»."""
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+def agent_activity_summary(agent_id: str, hours: int = 24, date: str | None = None, idle_threshold: int = 60) -> dict:
+    """Сводка по бездействию и набору символов за период."""
+    since, until = _time_range(date, hours)
     with Session(engine) as session:
         # idle: суммируем interval_seconds где idle_seconds > threshold = «не за компом»
         idle_rows = session.exec(
             select(IdleSample)
             .where(IdleSample.agent_id == agent_id)
             .where(IdleSample.captured_at >= since)
+            .where(IdleSample.captured_at < until)
         ).all()
         total_interval = sum(r.interval_seconds for r in idle_rows)
         idle_interval = sum(r.interval_seconds for r in idle_rows if r.idle_seconds > idle_threshold)
@@ -450,6 +470,7 @@ def agent_activity_summary(agent_id: str, hours: int = 24, idle_threshold: int =
             select(KeystrokeSample.app_name, func.sum(KeystrokeSample.keystroke_count))
             .where(KeystrokeSample.agent_id == agent_id)
             .where(KeystrokeSample.captured_at >= since)
+            .where(KeystrokeSample.captured_at < until)
             .group_by(KeystrokeSample.app_name)
         ).all()
         ks_by_app = sorted(
@@ -491,14 +512,15 @@ def list_windows(agent_id: str, limit: int = 200) -> list[dict]:
 
 
 @app.get("/agents/{agent_id}/summary")
-def agent_summary(agent_id: str, hours: int = 24) -> dict:
-    """Свод по приложениям за последние N часов: сколько секунд в каждом."""
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+def agent_summary(agent_id: str, hours: int = 24, date: str | None = None) -> dict:
+    """Свод по приложениям за период."""
+    since, until = _time_range(date, hours)
     with Session(engine) as session:
         rows = session.exec(
             select(WindowSample.app_name, func.sum(WindowSample.duration_seconds))
             .where(WindowSample.agent_id == agent_id)
             .where(WindowSample.captured_at >= since)
+            .where(WindowSample.captured_at < until)
             .group_by(WindowSample.app_name)
         ).all()
         items = sorted(
@@ -775,20 +797,18 @@ def set_app_category(payload: CategoryIn) -> dict:
 
 
 @app.get("/agents/{agent_id}/day_summary")
-def agent_day_summary(agent_id: str, hours: int = 24) -> dict:
-    """Свод дня менеджера: время по категориям + список приложений (с разбивкой
-    по доменам для браузеров) + время на встречах."""
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+def agent_day_summary(agent_id: str, hours: int = 24, date: str | None = None) -> dict:
+    """Свод дня менеджера: время по категориям + список приложений + время на встречах."""
+    since, until = _time_range(date, hours)
     with Session(engine) as session:
         app_map = get_category_map(session)
         domain_map = get_domain_category_map(session)
 
-        # Для браузеров не можем тупо группировать в БД — title содержит URL,
-        # домены разные. Берём все сэмплы и группируем в Python.
         samples = session.exec(
             select(WindowSample.app_name, WindowSample.title, WindowSample.duration_seconds)
             .where(WindowSample.agent_id == agent_id)
             .where(WindowSample.captured_at >= since)
+            .where(WindowSample.captured_at < until)
         ).all()
 
         by_category: dict[str, int] = {"work": 0, "personal": 0, "neutral": 0}
@@ -819,6 +839,7 @@ def agent_day_summary(agent_id: str, hours: int = 24) -> dict:
             .where(Meeting.agent_id == agent_id)
             .where(Meeting.ended_at.is_not(None))
             .where(Meeting.ended_at >= since)
+            .where(Meeting.ended_at < until)
         ).all()
         meeting_seconds = sum(
             int((_as_utc(m.ended_at) - _as_utc(m.started_at)).total_seconds())
@@ -937,14 +958,12 @@ def assign_agent_to_office(agent_id: str, office_id: int | None = None) -> dict:
 # ---------- Команда (overview всех агентов) ----------
 
 @app.get("/overview")
-def team_overview(hours: int = 24) -> dict:
-    """Свод по всем агентам за период hours: для главного экрана.
-    Возвращает по каждому агенту: статус online, разбивка времени по категориям,
-    кол-во встреч + средняя оценка, продуктивность из последнего daily report,
-    кол-во голос-сегментов с разбивкой по kind."""
+def team_overview(hours: int = 24, date: str | None = None) -> dict:
+    """Свод по всем агентам за период hours или за конкретный день."""
     now = datetime.now(timezone.utc)
-    since = now - timedelta(hours=hours)
-    today_str = now.strftime("%Y-%m-%d")
+    since, until = _time_range(date, hours)
+    # для daily report берём дату из параметра, или сегодняшнюю
+    today_str = date if date else now.strftime("%Y-%m-%d")
 
     with Session(engine) as session:
         agents = session.exec(select(Agent).order_by(Agent.last_seen.desc())).all()
@@ -965,6 +984,7 @@ def team_overview(hours: int = 24) -> dict:
                 select(WindowSample.app_name, WindowSample.title, WindowSample.duration_seconds)
                 .where(WindowSample.agent_id == a.agent_id)
                 .where(WindowSample.captured_at >= since)
+                .where(WindowSample.captured_at < until)
             ).all()
             by_cat = {"work": 0, "personal": 0, "neutral": 0}
             for app_name, title, secs in samples:
@@ -1271,13 +1291,14 @@ def get_screenshot_image(screenshot_id: int):
 
 
 @app.get("/agents/{agent_id}/screenshots")
-def list_screenshots(agent_id: str, hours: int = 24, limit: int = 200) -> list[dict]:
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+def list_screenshots(agent_id: str, hours: int = 24, date: str | None = None, limit: int = 200) -> list[dict]:
+    since, until = _time_range(date, hours)
     with Session(engine) as session:
         rows = session.exec(
             select(Screenshot)
             .where(Screenshot.agent_id == agent_id)
             .where(Screenshot.captured_at >= since)
+            .where(Screenshot.captured_at < until)
             .order_by(Screenshot.captured_at.desc())
             .limit(limit)
         ).all()
@@ -1298,14 +1319,15 @@ def list_screenshots(agent_id: str, hours: int = 24, limit: int = 200) -> list[d
 
 
 @app.get("/agents/{agent_id}/conversations")
-def list_conversations(agent_id: str, hours: int = 24, limit: int = 100) -> list[dict]:
+def list_conversations(agent_id: str, hours: int = 24, date: str | None = None, limit: int = 100) -> list[dict]:
     """Сгруппированные разговоры (последовательные voice segments) за период."""
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    since, until = _time_range(date, hours)
     with Session(engine) as session:
         rows = session.exec(
             select(Conversation)
             .where(Conversation.agent_id == agent_id)
             .where(Conversation.started_at >= since)
+            .where(Conversation.started_at < until)
             .order_by(Conversation.started_at.desc())
             .limit(limit)
         ).all()
@@ -1333,14 +1355,15 @@ def list_conversations(agent_id: str, hours: int = 24, limit: int = 100) -> list
 
 
 @app.get("/agents/{agent_id}/conversations_summary")
-def conversations_summary(agent_id: str, hours: int = 24) -> dict:
+def conversations_summary(agent_id: str, hours: int = 24, date: str | None = None) -> dict:
     """Сводка: сколько разговоров каждого типа, сверка кнопка vs запись."""
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    since, until = _time_range(date, hours)
     with Session(engine) as session:
         convs = session.exec(
             select(Conversation)
             .where(Conversation.agent_id == agent_id)
             .where(Conversation.started_at >= since)
+            .where(Conversation.started_at < until)
         ).all()
         by_kind: dict[str, dict] = {}
         sales_attempts = 0
@@ -1361,6 +1384,7 @@ def conversations_summary(agent_id: str, hours: int = 24) -> dict:
             select(Meeting)
             .where(Meeting.agent_id == agent_id)
             .where(Meeting.started_at >= since)
+            .where(Meeting.started_at < until)
         ).all()
         meetings_by_button = len(meetings)
         meetings_by_recording = by_kind.get("meeting", {}).get("count", 0)
@@ -1431,15 +1455,17 @@ def get_conversation(conversation_id: int) -> dict:
 def list_voice_segments(
     agent_id: str,
     hours: int = 8,
+    date: str | None = None,
     limit: int = 200,
     transcribed_only: bool = False,
 ) -> list[dict]:
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    since, until = _time_range(date, hours)
     with Session(engine) as session:
         q = (
             select(VoiceSegment)
             .where(VoiceSegment.agent_id == agent_id)
             .where(VoiceSegment.started_at >= since)
+            .where(VoiceSegment.started_at < until)
             .order_by(VoiceSegment.started_at.desc())
             .limit(limit)
         )
