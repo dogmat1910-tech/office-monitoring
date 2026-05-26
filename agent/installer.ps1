@@ -120,20 +120,32 @@ Register-ScheduledTask -TaskName $TaskWatch -Action $actionW -Trigger @($trigger
 Ok "Scheduled Task '$TaskWatch' создан"
 
 # --- ACL: только админ может удалить/изменить ---
+# icacls на ru-RU не понимает имя 'Users' — используем SID через '*S-...'
+# (Administrators=S-1-5-32-544, SYSTEM=S-1-5-18, Users=S-1-5-32-545).
+# Оборачиваем в try/catch: без ACL агент работает, не должно валить установку.
 Info "Защищаю папку через ACL..."
-& icacls.exe $InstallDir /inheritance:r `
-    /grant:r "Administrators:(OI)(CI)F" `
-    /grant:r "SYSTEM:(OI)(CI)F" `
-    /grant:r "Users:(OI)(CI)RX" /T | Out-Null
-& icacls.exe $InstallDir /deny "Users:(DE,DC,WDAC,WO)" /T 2>$null | Out-Null
-Ok "ACL обновлён"
+try {
+    & icacls.exe $InstallDir /inheritance:r `
+        /grant:r "*S-1-5-32-544:(OI)(CI)F" `
+        /grant:r "*S-1-5-18:(OI)(CI)F" `
+        /grant:r "*S-1-5-32-545:(OI)(CI)RX" /T *>&1 | Out-Null
+    & icacls.exe $InstallDir /deny "*S-1-5-32-545:(DE,DC,WDAC,WO)" /T *>&1 | Out-Null
+    Ok "ACL обновлён ($InstallDir)"
+} catch {
+    Warn "Не удалось применить ACL для $InstallDir : $_"
+}
 
 # DataDir — лог должен быть на запись от пользователя, но без удаления файлов
-& icacls.exe $DataDir /inheritance:r `
-    /grant:r "Administrators:(OI)(CI)F" `
-    /grant:r "SYSTEM:(OI)(CI)F" `
-    /grant:r "Users:(OI)(CI)RX(WD,AD)" /T | Out-Null
-& icacls.exe $DataDir /deny "Users:(DE,DC)" /T 2>$null | Out-Null
+try {
+    & icacls.exe $DataDir /inheritance:r `
+        /grant:r "*S-1-5-32-544:(OI)(CI)F" `
+        /grant:r "*S-1-5-18:(OI)(CI)F" `
+        /grant:r "*S-1-5-32-545:(OI)(CI)RX(WD,AD)" /T *>&1 | Out-Null
+    & icacls.exe $DataDir /deny "*S-1-5-32-545:(DE,DC)" /T *>&1 | Out-Null
+    Ok "ACL обновлён ($DataDir)"
+} catch {
+    Warn "Не удалось применить ACL для $DataDir : $_"
+}
 
 # --- Запускаем ---
 Info "Запускаю агент и watchdog..."
