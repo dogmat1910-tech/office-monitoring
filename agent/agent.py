@@ -26,6 +26,7 @@ import httpx
 from active_window import get_active_window
 from audio import AudioRecorder
 from always_on_audio import AlwaysOnRecorder
+from auth import ensure_token
 from categories import CategoryResolver
 from diagnostics import collect_diagnostics
 from idle import get_idle_seconds
@@ -34,7 +35,7 @@ from local_buffer import LocalBuffer
 from screenshot import capture_primary_jpeg
 from updater import check_and_apply_update
 
-AGENT_VERSION = "0.9.3"
+AGENT_VERSION = "0.9.4"
 DIAGNOSTICS_INTERVAL_SEC = 3600  # раз в час
 UPDATE_CHECK_INTERVAL_SEC = int(os.environ.get("OM_UPDATE_CHECK_SEC", "300"))  # 5 минут
 BUFFER_DRAIN_BATCH = 20  # сколько накопленных запросов отправляем за один цикл
@@ -367,10 +368,17 @@ def main() -> None:
     last_flush = time.monotonic()
     debug_sample = os.environ.get("OM_DEBUG_SAMPLE", "0") == "1"
 
+    # Per-machine Bearer-токен. Если его нет — регистрируемся через install-код.
+    auth_token = ensure_token(SERVER_URL, agent_id, hostname, username)
+    auth_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    if not auth_token:
+        log.warning("agent работает без bearer-токена — сервер может отбивать 401, "
+                    "если OM_REQUIRE_AGENT_AUTH=1 включён")
+
     # trust_env=False — игнорируем HTTP_PROXY/HTTPS_PROXY/ALL_PROXY (включая SOCKS).
     # Корпоративные ноутбуки иногда сидят за SOCKS-VPN (Outline/Shadowsocks), который
     # ломает httpx без отдельной либы. Наш агент ходит на свой сервер напрямую.
-    with httpx.Client(trust_env=False) as client:
+    with httpx.Client(trust_env=False, headers=auth_headers) as client:
         # первичная загрузка категорий с сервера
         category_resolver.refresh(client)
         # стартовый снимок diagnostics

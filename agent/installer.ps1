@@ -5,6 +5,7 @@
 $ErrorActionPreference = "Stop"
 
 $ServerUrl   = if ($env:OM_SERVER_URL) { $env:OM_SERVER_URL } else { "https://office.lkdzrkk.pro" }
+$InstallCode = if ($env:OM_INSTALL_CODE) { $env:OM_INSTALL_CODE } else { "" }
 $InstallDir  = "C:\Program Files\office-monitoring"
 $DataDir     = "C:\ProgramData\office-monitoring"
 $TaskAgent   = "OfficeMonitoring"
@@ -28,9 +29,21 @@ if (-not $isAdmin) {
     Fail "Запусти PowerShell от имени администратора"
 }
 
+# Install-код. Без него агент не сможет зарегистрироваться на сервере
+# (если на сервере включён OM_REQUIRE_AGENT_AUTH). Берётся из env OM_INSTALL_CODE,
+# иначе спрашиваем интерактивно.
+if (-not $InstallCode) {
+    $InstallCode = Read-Host "Install-код от сервера (узнать у админа; пусто = пропустить)"
+}
+
 Info "office-monitoring agent installer (EXE-based)"
 Info "Сервер: $ServerUrl"
 Info "Папка установки: $InstallDir"
+if ($InstallCode) {
+    Info "Install-код задан, агент зарегистрируется при первом старте"
+} else {
+    Warn "Install-код не задан — авторизация не сработает если на сервере включён enforce"
+}
 
 # --- Папки ---
 Info "Создаю $InstallDir, $DataDir"
@@ -73,6 +86,7 @@ set OM_LOG_DIR=$DataDir
 set OM_INSTALL_DIR=$InstallDir
 set OM_DATA_DIR=$DataDir
 set OM_ENABLE_ALWAYS_ON_AUDIO=1
+set OM_INSTALL_CODE=$InstallCode
 cd /d "$InstallDir"
 start "" "$agentPath"
 "@ | Set-Content -Path $runAgentBat -Encoding ASCII

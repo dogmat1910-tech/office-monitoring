@@ -1,12 +1,14 @@
+import hashlib
 import json
 import os
 import re
+import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlmodel import Field, Session, SQLModel, create_engine, select
@@ -26,6 +28,12 @@ engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, connect_args={"check_
 # Конфигурируется через env. На сервере хранится в /etc/systemd/system/office-monitoring.service
 # (Environment="OM_API_TOKEN=..."). Если не задан — meeting-эндпоинты вернут 503.
 API_TOKEN = os.environ.get("OM_API_TOKEN", "")
+
+# Per-machine токены для агента: при установке installer.ps1 шлёт
+# install-код, сервер выдаёт уникальный bearer-токен для машины.
+# Дальше агент шлёт его в Authorization: Bearer на все защищённые эндпоинты.
+INSTALL_CODE = os.environ.get("OM_INSTALL_CODE", "")
+REQUIRE_AGENT_AUTH = os.environ.get("OM_REQUIRE_AGENT_AUTH", "0") == "1"
 
 
 class Office(SQLModel, table=True):
@@ -55,6 +63,18 @@ class Heartbeat(SQLModel, table=True):
     agent_id: str = Field(index=True)
     received_at: datetime
     agent_version: str | None = None
+
+
+class AgentToken(SQLModel, table=True):
+    """Per-machine Bearer-токен. Хранится только sha256(token), сам токен — нет.
+    При компрометации БД нельзя восстановить рабочие токены."""
+    id: int | None = Field(default=None, primary_key=True)
+    agent_id: str = Field(index=True)
+    token_hash: str = Field(unique=True, index=True)
+    created_at: datetime
+    revoked_at: datetime | None = None
+    last_used_at: datetime | None = None
+    note: str | None = None  # "ноут Васи Пупкина" — для админа
 
 
 class WindowSample(SQLModel, table=True):
@@ -308,6 +328,53 @@ class MeetingStopIn(BaseModel):
 app = FastAPI(title="office-monitoring server", version="0.4.0")
 
 
+# Защищённые агентские пути — для записи данных. GET-эндпоинты остаются публичными
+# (категории, версия) — это нужно для bootstrap'а нового агента.
+_AGENT_PROTECTED_EXACT = {
+    "/heartbeat", "/window_samples", "/idle_samples", "/keystroke_samples",
+    "/voice_segments", "/screenshots", "/diagnostics",
+}
+_AGENT_PROTECTED_RE = [
+    re.compile(r"^/meetings/[^/]+/audio$"),
+    re.compile(r"^/agents/[^/]+/active_meeting$"),
+]
+
+
+def _is_protected_agent_path(path: str) -> bool:
+    if path in _AGENT_PROTECTED_EXACT:
+        return True
+    return any(p.match(path) for p in _AGENT_PROTECTED_RE)
+
+
+@app.middleware("http")
+async def agent_auth_middleware(request: Request, call_next):
+    """Проверяет Authorization: Bearer <token> для агентских записывающих эндпоинтов.
+
+    Если OM_REQUIRE_AGENT_AUTH=0 — пропускает всё (backward compat для агентов
+    которые ещё не обновились на версию с per-machine токенами).
+    После того как все агенты получат токены — включаем enforce."""
+    if REQUIRE_AGENT_AUTH and request.method in ("POST", "PUT") and _is_protected_agent_path(request.url.path):
+        authz = request.headers.get("authorization", "")
+        if not authz.lower().startswith("bearer "):
+            return JSONResponse({"detail": "missing bearer token"}, status_code=401)
+        token = authz[7:].strip()
+        if not token:
+            return JSONResponse({"detail": "empty bearer token"}, status_code=401)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        with Session(engine) as session:
+            row = session.exec(
+                select(AgentToken)
+                .where(AgentToken.token_hash == token_hash)
+                .where(AgentToken.revoked_at == None)  # noqa: E711
+            ).first()
+            if not row:
+                return JSONResponse({"detail": "invalid or revoked token"}, status_code=401)
+            row.last_used_at = datetime.now(timezone.utc)
+            session.add(row)
+            session.commit()
+    return await call_next(request)
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     SQLModel.metadata.create_all(engine)
@@ -403,6 +470,81 @@ def get_agent_version() -> dict:
     if watchdog_exe.exists():
         out["sha256_watchdog"] = _cached_sha256(watchdog_exe)
     return out
+
+
+class AgentRegisterIn(BaseModel):
+    install_code: str
+    agent_id: str
+    hostname: str | None = None
+    username: str | None = None
+
+
+@app.post("/agent/register")
+def agent_register(payload: AgentRegisterIn) -> dict:
+    """Выдаёт per-machine Bearer-токен в обмен на install-код.
+    Если для agent_id уже есть активный токен — отзывает его (переустановка машины).
+    """
+    if not INSTALL_CODE:
+        raise HTTPException(503, "install code not configured on server")
+    # constant-time сравнение чтобы не давать таймингу подсказать длину
+    if not secrets.compare_digest(payload.install_code, INSTALL_CODE):
+        raise HTTPException(401, "invalid install code")
+
+    token = secrets.token_urlsafe(48)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    now = datetime.now(timezone.utc)
+
+    with Session(engine) as session:
+        active = session.exec(
+            select(AgentToken)
+            .where(AgentToken.agent_id == payload.agent_id)
+            .where(AgentToken.revoked_at == None)  # noqa: E711
+        ).all()
+        for old in active:
+            old.revoked_at = now
+            session.add(old)
+        new_row = AgentToken(
+            agent_id=payload.agent_id,
+            token_hash=token_hash,
+            created_at=now,
+            note=f"{payload.hostname or '?'}/{payload.username or '?'}",
+        )
+        session.add(new_row)
+        session.commit()
+
+    return {"token": token, "agent_id": payload.agent_id}
+
+
+@app.get("/agent_tokens")
+def list_agent_tokens() -> list[dict]:
+    with Session(engine) as session:
+        rows = session.exec(
+            select(AgentToken).order_by(AgentToken.created_at.desc())
+        ).all()
+        return [
+            {
+                "id": r.id,
+                "agent_id": r.agent_id,
+                "created_at": _as_utc(r.created_at).isoformat(),
+                "revoked_at": _as_utc(r.revoked_at).isoformat() if r.revoked_at else None,
+                "last_used_at": _as_utc(r.last_used_at).isoformat() if r.last_used_at else None,
+                "note": r.note,
+            }
+            for r in rows
+        ]
+
+
+@app.post("/agent_tokens/{token_id}/revoke")
+def revoke_agent_token(token_id: int) -> dict:
+    with Session(engine) as session:
+        row = session.get(AgentToken, token_id)
+        if not row:
+            raise HTTPException(404, "token not found")
+        if row.revoked_at is None:
+            row.revoked_at = datetime.now(timezone.utc)
+            session.add(row)
+            session.commit()
+        return {"ok": True, "agent_id": row.agent_id}
 
 
 @app.get("/health")
