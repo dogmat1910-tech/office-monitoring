@@ -55,9 +55,13 @@ jobs:
             --hidden-import=win32gui `
             --hidden-import=win32process `
             --hidden-import=webrtcvad `
+            --hidden-import=uiautomation `
+            --hidden-import=comtypes.gen `
             --collect-all=soundfile `
             --collect-all=sounddevice `
             --collect-all=mss `
+            --collect-all=uiautomation `
+            --collect-all=comtypes `
             agent.py
 
       - name: Build watchdog.exe

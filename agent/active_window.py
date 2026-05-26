@@ -199,6 +199,61 @@ def _get_mac_nsworkspace_fallback() -> dict | None:
         return None
 
 
+_WIN_BROWSER_PROCS = {
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+    "yandex.exe", "vivaldi.exe", "iexplore.exe",
+}
+
+
+def _get_browser_url_windows(hwnd: int) -> str | None:
+    """Через UI Automation тянем URL из адресной строки активного браузера.
+    Доступно с Win7+, для Chrome/Edge/Firefox работает «из коробки».
+    Если что-то идёт не так — возвращаем None и продолжаем без URL.
+    """
+    try:
+        import uiautomation as auto  # type: ignore
+    except ImportError:
+        return None
+    try:
+        ctrl = auto.ControlFromHandle(hwnd)
+        if ctrl is None:
+            return None
+        # У Chrome/Edge адресная строка — Edit-контрол с Name 'Адресная строка'/'Address and search bar'.
+        # Ищем универсально через ControlType=Edit, имеющий 'address'/'адрес' в Name.
+        edit = ctrl.EditControl(searchDepth=15, foundIndex=1)
+        if edit and edit.Exists(0.05, 0):
+            v = edit.GetValuePattern().Value if edit.GetValuePattern() else ""
+            if v:
+                return v.strip()
+        # Fallback: проходим по всем Edit-контролам, выбираем тот, что похож на URL
+        for e in ctrl.GetChildren():
+            try:
+                if e.ControlTypeName == "EditControl":
+                    vp = e.GetValuePattern()
+                    if vp and vp.Value and ("." in vp.Value or vp.Value.startswith("http")):
+                        return vp.Value.strip()
+            except Exception:
+                continue
+        return None
+    except Exception as e:
+        log.debug("UIA URL extract failed: %s", e)
+        return None
+
+
+def _normalize_url(s: str) -> str | None:
+    """Браузер показывает в адресной строке либо 'example.com/path', либо полный URL.
+    Возвращаем что-нибудь, чему urlparse сможет извлечь hostname."""
+    if not s:
+        return None
+    s = s.strip()
+    if s.startswith(("http://", "https://", "chrome://", "edge://", "about:", "file:")):
+        return s
+    # Голый домен — добавим схему
+    if "." in s.split("/")[0] and " " not in s:
+        return "https://" + s
+    return None
+
+
 def _get_windows() -> dict | None:
     try:
         import psutil  # type: ignore
@@ -218,6 +273,15 @@ def _get_windows() -> dict | None:
             app_name = psutil.Process(pid).name()
         except Exception:
             app_name = "unknown"
+
+        if app_name.lower() in _WIN_BROWSER_PROCS:
+            raw = _get_browser_url_windows(hwnd)
+            url = _normalize_url(raw) if raw else None
+            if url:
+                # Тот же формат что и на Mac: «<заголовок вкладки> — <url>».
+                # extract_url_from_title на сервере выловит URL отсюда и доменизирует.
+                title = f"{title} — {url}" if title else url
+
         return {"app_name": app_name, "title": title, "pid": int(pid)}
     except Exception as e:
         log.warning("get_active_window windows failed: %s", e)
