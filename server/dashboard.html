@@ -563,6 +563,19 @@
       const d = new Date(iso);
       return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
     };
+    const fmtDateTime = (iso) => {
+      const d = new Date(iso);
+      const today = new Date();
+      const isToday = d.toDateString() === today.toDateString();
+      const yesterday = new Date(today);
+      yesterday.setDate(yesterday.getDate() - 1);
+      const isYesterday = d.toDateString() === yesterday.toDateString();
+      const time = d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      if (isToday) return `сегодня ${time}`;
+      if (isYesterday) return `вчера ${time}`;
+      const date = d.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric" });
+      return `${date} ${time}`;
+    };
     const escapeHTML = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 
     let selectedAgent = null;
@@ -699,7 +712,7 @@
       renderWindows(windows);
       renderConversations(conversations, convSum);
       renderScreenshots(screenshots);
-      $("#updated").textContent = "обновлено " + fmtTime(new Date().toISOString());
+      $("#updated").textContent = "обновлено " + fmtDateTime(new Date().toISOString());
     }
 
     function renderScreenshots(items) {
