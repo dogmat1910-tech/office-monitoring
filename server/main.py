@@ -207,6 +207,27 @@ class IdleSample(SQLModel, table=True):
     interval_seconds: int  # длительность периода с прошлого сэмпла
 
 
+class KeystrokeText(SQLModel, table=True):
+    """Записанный текст из whitelisted приложения (Telegram/WhatsApp/VK).
+    Только если на клиенте включён OM_ENABLE_KEYSTROKE_TEXT=1. По умолчанию
+    отключено — требует юр.оформления (152-ФЗ, 138 УК).
+    Текст уже отфильтрован от потенциальных секретов на стороне агента
+    (длинные alphanumeric → [REDACTED]). Доступ к raw тексту в дашборде —
+    только админу с явным повышением прав, каждый просмотр логируется."""
+    id: int | None = Field(default=None, primary_key=True)
+    agent_id: str = Field(index=True)
+    app_name: str
+    window_title: str
+    started_at: datetime = Field(index=True)
+    ended_at: datetime
+    text: str  # уже маскированный
+    char_count: int  # длина оригинала до маскирования
+    llm_category: str | None = None  # work | personal | unclear (заполняет фоновый воркер)
+    llm_confidence: float | None = None
+    llm_reason: str | None = None
+    received_at: datetime
+
+
 class KeystrokeSample(SQLModel, table=True):
     """Агрегированная статистика нажатий клавиш по приложению/окну.
     НЕ хранит содержимое нажатий — только счётчик."""
@@ -335,6 +356,20 @@ class KeystrokeSamplesIn(BaseModel):
     samples: list[KeystrokeSampleIn]
 
 
+class KeystrokeTextSessionIn(BaseModel):
+    app_name: str
+    window_title: str = ""
+    started_at: datetime
+    ended_at: datetime
+    text: str
+    char_count: int = 0
+
+
+class KeystrokeTextsIn(BaseModel):
+    agent_id: str
+    sessions: list[KeystrokeTextSessionIn]
+
+
 class MeetingStartIn(BaseModel):
     agent_id: str
     client_name: str | None = None
@@ -355,7 +390,7 @@ app = FastAPI(title="office-monitoring server", version="0.4.0")
 # (категории, версия) — это нужно для bootstrap'а нового агента.
 _AGENT_PROTECTED_EXACT = {
     "/heartbeat", "/window_samples", "/idle_samples", "/keystroke_samples",
-    "/voice_segments", "/screenshots", "/diagnostics",
+    "/keystroke_texts", "/voice_segments", "/screenshots", "/diagnostics",
 }
 _AGENT_PROTECTED_RE = [
     re.compile(r"^/meetings/[^/]+/audio$"),
@@ -767,6 +802,33 @@ def post_keystroke_samples(payload: KeystrokeSamplesIn) -> dict:
             ))
         session.commit()
     return {"status": "ok", "count": len(payload.samples)}
+
+
+@app.post("/keystroke_texts")
+def post_keystroke_texts(payload: KeystrokeTextsIn) -> dict:
+    """Принимает записанный текст из whitelisted приложений (Telegram/WhatsApp/VK).
+    Текст уже маскирован на клиенте (длинные alphanumeric → [REDACTED]).
+    Фоновая LLM-классификация (work/personal/unclear) запускается отдельным
+    воркером — здесь только складываем сырой текст."""
+    if not payload.sessions:
+        return {"status": "ok", "count": 0}
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        for s in payload.sessions:
+            if not (s.text or "").strip():
+                continue
+            session.add(KeystrokeText(
+                agent_id=payload.agent_id,
+                app_name=s.app_name,
+                window_title=s.window_title or "",
+                started_at=_as_utc(s.started_at),
+                ended_at=_as_utc(s.ended_at),
+                text=s.text,
+                char_count=s.char_count or len(s.text),
+                received_at=now,
+            ))
+        session.commit()
+    return {"status": "ok", "count": len(payload.sessions)}
 
 
 @app.get("/agents/{agent_id}/activity_summary")

