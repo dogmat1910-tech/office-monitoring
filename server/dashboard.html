@@ -441,7 +441,15 @@
               </select>
             </label>
             <label class="muted"><input type="checkbox" id="teamOnlyOnline"> только online</label>
+            <label class="muted">офис:
+              <select id="teamOfficeFilter">
+                <option value="">все</option>
+              </select>
+            </label>
+            <label class="muted"><input type="checkbox" id="teamGroupByOffice" checked> группировать</label>
+            <button class="btn-sim" id="teamManageOffices">⚙ офисы</button>
           </div>
+          <div id="teamOfficesSummary" class="day-summary" style="grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));"></div>
           <div id="teamTable"></div>
         </div>
       </div>
@@ -521,6 +529,23 @@
   <div id="scrModal" class="scr-modal" onclick="this.classList.remove('open')">
     <span class="close">&times;</span>
     <img id="scrModalImg">
+  </div>
+
+  <!-- Модалка управления офисами -->
+  <div id="officeModal" class="scr-modal">
+    <div onclick="event.stopPropagation()" style="background: var(--panel); border-radius: 8px; padding: 20px; max-width: 700px; width: 100%; max-height: 80vh; overflow-y: auto;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+        <h2 style="margin: 0;">Управление офисами</h2>
+        <span class="close" style="position: static; font-size: 24px;" onclick="document.getElementById('officeModal').classList.remove('open')">&times;</span>
+      </div>
+      <div id="officeList"></div>
+      <h3 style="margin-top: 20px;">Создать новый</h3>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+        <input id="newOfficeName" class="token-input" placeholder="Название (напр. Москва-1)">
+        <input id="newOfficeCity" class="token-input" placeholder="Город">
+      </div>
+      <button class="btn-primary" id="createOfficeBtn" style="margin-top: 10px;">Создать офис</button>
+    </div>
   </div>
 
   <script>
@@ -1005,8 +1030,11 @@
     async function loadTeam() {
       const hours = $("#hours").value;
       try {
-        const r = await fetch(`/overview?hours=${hours}`);
-        teamData = await r.json();
+        const [overR, _offices] = await Promise.all([
+          fetch(`/overview?hours=${hours}`),
+          loadOffices(),
+        ]);
+        teamData = await overR.json();
         renderTeam();
       } catch (e) {
         $("#teamTable").innerHTML = `<div class="empty">ошибка загрузки: ${e}</div>`;
@@ -1020,12 +1048,48 @@
       return "high";
     }
 
+    let allOffices = [];
+
+    async function loadOffices() {
+      try {
+        const r = await fetch("/offices");
+        allOffices = await r.json();
+      } catch (e) {
+        allOffices = [];
+      }
+      // обновляем dropdown фильтра
+      const sel = $("#teamOfficeFilter");
+      const prev = sel.value;
+      sel.innerHTML = '<option value="">все офисы</option>' +
+        allOffices.map(o => `<option value="${o.name}">${escapeHTML(o.name)} (${o.agents_count})</option>`).join("") +
+        '<option value="__none__">(без офиса)</option>';
+      sel.value = prev;
+    }
+
     function renderTeam() {
       if (!teamData) return;
       const onlyOnline = $("#teamOnlyOnline").checked;
       const sortBy = $("#teamSort").value;
+      const officeFilter = $("#teamOfficeFilter").value;
+      const groupByOffice = $("#teamGroupByOffice").checked;
       let agents = teamData.agents.slice();
       if (onlyOnline) agents = agents.filter(a => a.online);
+      if (officeFilter === "__none__") {
+        agents = agents.filter(a => !a.office);
+      } else if (officeFilter) {
+        agents = agents.filter(a => a.office && a.office.name === officeFilter);
+      }
+
+      // плитки по офисам — сводка
+      const off = teamData.offices_summary || [];
+      $("#teamOfficesSummary").innerHTML = off.map(o => {
+        const utilWork = o.work_seconds + o.personal_seconds > 0
+          ? Math.round(o.work_seconds * 100 / (o.work_seconds + o.personal_seconds)) : 0;
+        return `<div class="day-tile work"><div class="label">${escapeHTML(o.name)}</div>
+          <div class="value" style="font-size: 16px;">${o.agents_online}/${o.agents_total} · ${o.meetings_count} встр.</div>
+          <div class="muted" style="font-size: 11px; margin-top: 2px;">${utilWork}% работа · 🚨 ${o.red_flags_count}</div>
+        </div>`;
+      }).join("");
 
       const sortKey = (a) => {
         switch (sortBy) {
@@ -1054,7 +1118,12 @@
           <div style="text-align:center">🚨</div>
         </div>`;
 
-      const rows = agents.map(a => {
+      const officeOptions = (currentName) => {
+        return '<option value="">— без офиса —</option>' +
+          allOffices.map(o => `<option value="${o.office_id}" ${currentName === o.name ? 'selected' : ''}>${escapeHTML(o.name)}</option>`).join("");
+      };
+
+      const renderRow = (a) => {
         const total = (a.by_category.work || 0) + (a.by_category.personal || 0) + (a.by_category.neutral || 0) + (a.meeting_seconds || 0);
         const pct = (s) => total > 0 ? (s / total * 100).toFixed(1) + "%" : "0%";
         const fmt = (s) => fmtSec(s);
@@ -1064,12 +1133,17 @@
           ? a.daily_score
           : (a.daily_status === "pending" ? "⏳" : "—");
         const rfCls = a.red_flags_count > 0 ? "" : "zero";
+        const officeName = a.office ? a.office.name : "";
         return `
           <div class="team-row" data-id="${a.agent_id}">
             <div><span class="dot ${a.online ? 'online' : 'offline'}"></span></div>
             <div class="team-name">
               ${escapeHTML(a.hostname)}${meetingBadge}
-              <div class="meta">${escapeHTML(a.username)} · ${a.online ? 'online' : 'offline'}</div>
+              <div class="meta">${escapeHTML(a.username)} · ${a.online ? 'online' : 'offline'} ·
+                <select class="cat-select office-select" data-agent="${a.agent_id}" onclick="event.stopPropagation()">
+                  ${officeOptions(officeName)}
+                </select>
+              </div>
             </div>
             <div>
               <div class="team-stack" title="работа ${fmt(a.by_category.work)} · встречи ${fmt(a.meeting_seconds)} · нейтр. ${fmt(a.by_category.neutral)} · личное ${fmt(a.by_category.personal)}">
@@ -1091,20 +1165,94 @@
             <div><div class="team-score ${scoreCls}">${scoreLabel}</div></div>
             <div class="team-redflags ${rfCls}">${a.red_flags_count || 0}</div>
           </div>`;
-      }).join("");
+      };
 
-      $("#teamTable").innerHTML = head + (rows || '<div class="empty">нет агентов</div>');
+      let bodyHtml;
+      if (groupByOffice) {
+        const groups = {};
+        for (const a of agents) {
+          const key = a.office ? a.office.name : "(без офиса)";
+          if (!groups[key]) groups[key] = [];
+          groups[key].push(a);
+        }
+        bodyHtml = Object.entries(groups).map(([name, list]) => `
+          <div style="margin-top: 16px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px;">
+            ${escapeHTML(name)} — ${list.length}
+          </div>
+          ${list.map(renderRow).join("")}
+        `).join("");
+      } else {
+        bodyHtml = agents.map(renderRow).join("");
+      }
 
-      $$(".team-row[data-id]").forEach(row => row.addEventListener("click", () => {
+      $("#teamTable").innerHTML = head + (bodyHtml || '<div class="empty">нет агентов</div>');
+
+      $$(".team-row[data-id]").forEach(row => row.addEventListener("click", (e) => {
+        if (e.target.closest(".office-select")) return;
         selectedAgent = row.dataset.id;
         loadAgents();
         loadAgentData();
         applyTab("today");
       }));
+      $$(".office-select").forEach(sel => sel.addEventListener("change", async (e) => {
+        e.stopPropagation();
+        const office_id = sel.value ? parseInt(sel.value, 10) : null;
+        await fetch(`/agents/${sel.dataset.agent}/office?office_id=${office_id ?? ''}`, { method: "POST" });
+        loadTeam();
+      }));
     }
+
+    // ───────────── Управление офисами (модалка) ─────────────
+    async function renderOfficeManager() {
+      await loadOffices();
+      const el = $("#officeList");
+      if (!allOffices.length) {
+        el.innerHTML = '<div class="empty">офисов пока нет, создай первый ниже</div>';
+        return;
+      }
+      el.innerHTML = `<table>
+        <thead><tr><th>Название</th><th>Город</th><th class="num">Агентов</th><th></th></tr></thead>
+        <tbody>${allOffices.map(o => `
+          <tr>
+            <td><strong>${escapeHTML(o.name)}</strong></td>
+            <td class="muted">${escapeHTML(o.city || '—')}</td>
+            <td class="num">${o.agents_count}</td>
+            <td><button class="btn-sim stop" data-del="${o.office_id}">удалить</button></td>
+          </tr>`).join("")}</tbody>
+      </table>`;
+      el.querySelectorAll("[data-del]").forEach(b => b.addEventListener("click", async () => {
+        if (!confirm("Удалить офис? Привязки агентов сбросятся.")) return;
+        await fetch(`/offices/${b.dataset.del}`, { method: "DELETE" });
+        renderOfficeManager();
+        loadTeam();
+      }));
+    }
+
+    $("#teamManageOffices").addEventListener("click", () => {
+      $("#officeModal").classList.add("open");
+      renderOfficeManager();
+    });
+
+    $("#createOfficeBtn").addEventListener("click", async () => {
+      const name = $("#newOfficeName").value.trim();
+      const city = $("#newOfficeCity").value.trim() || null;
+      if (!name) { alert("укажи название"); return; }
+      const r = await fetch("/offices", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, city }),
+      });
+      if (!r.ok) { alert("Ошибка: " + (await r.text())); return; }
+      $("#newOfficeName").value = "";
+      $("#newOfficeCity").value = "";
+      renderOfficeManager();
+      loadTeam();
+    });
 
     $("#teamSort").addEventListener("change", renderTeam);
     $("#teamOnlyOnline").addEventListener("change", renderTeam);
+    $("#teamOfficeFilter").addEventListener("change", renderTeam);
+    $("#teamGroupByOffice").addEventListener("change", renderTeam);
 
     // ───────────── Tab: Daily Report ─────────────
     function todayLocal() {

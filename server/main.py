@@ -28,6 +28,18 @@ engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, connect_args={"check_
 API_TOKEN = os.environ.get("OM_API_TOKEN", "")
 
 
+class Office(SQLModel, table=True):
+    """Офис / отдел / город, к которому привязан менеджер.
+    Используется для группировки агентов в дашборде."""
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field(index=True, unique=True)
+    city: str | None = None
+    timezone: str | None = None  # например 'Europe/Moscow', 'Asia/Vladivostok'
+    work_hours_from: int = 9   # начало рабочего дня (час локального времени офиса)
+    work_hours_to: int = 18    # конец рабочего дня
+    created_at: datetime
+
+
 class Agent(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     agent_id: str = Field(index=True, unique=True)
@@ -35,6 +47,7 @@ class Agent(SQLModel, table=True):
     username: str
     first_seen: datetime
     last_seen: datetime
+    office_id: int | None = Field(default=None, index=True)
 
 
 class Heartbeat(SQLModel, table=True):
@@ -835,6 +848,92 @@ def recategorize_old_data() -> dict:
     return {"status": "ok", "note": "категории вычисляются динамически, пересчёт не нужен"}
 
 
+# ---------- Offices ----------
+
+class OfficeIn(BaseModel):
+    name: str
+    city: str | None = None
+    timezone: str | None = None
+    work_hours_from: int = 9
+    work_hours_to: int = 18
+
+
+@app.get("/offices")
+def list_offices() -> list[dict]:
+    with Session(engine) as session:
+        offices = session.exec(select(Office).order_by(Office.name)).all()
+        # подсчёт агентов на офис
+        counts: dict[int, int] = {}
+        for a in session.exec(select(Agent)).all():
+            if a.office_id is not None:
+                counts[a.office_id] = counts.get(a.office_id, 0) + 1
+        return [
+            {
+                "office_id": o.id,
+                "name": o.name,
+                "city": o.city,
+                "timezone": o.timezone,
+                "work_hours_from": o.work_hours_from,
+                "work_hours_to": o.work_hours_to,
+                "agents_count": counts.get(o.id, 0),
+            }
+            for o in offices
+        ]
+
+
+@app.post("/offices")
+def create_office(payload: OfficeIn) -> dict:
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        existing = session.exec(select(Office).where(Office.name == payload.name)).first()
+        if existing:
+            raise HTTPException(400, f"офис «{payload.name}» уже существует")
+        o = Office(
+            name=payload.name,
+            city=payload.city,
+            timezone=payload.timezone,
+            work_hours_from=payload.work_hours_from,
+            work_hours_to=payload.work_hours_to,
+            created_at=now,
+        )
+        session.add(o)
+        session.commit()
+        session.refresh(o)
+        return {"status": "ok", "office_id": o.id, "name": o.name}
+
+
+@app.delete("/offices/{office_id}")
+def delete_office(office_id: int) -> dict:
+    with Session(engine) as session:
+        o = session.exec(select(Office).where(Office.id == office_id)).first()
+        if o is None:
+            raise HTTPException(404, "офис не найден")
+        # отвязываем агентов от удаляемого офиса
+        for a in session.exec(select(Agent).where(Agent.office_id == office_id)).all():
+            a.office_id = None
+            session.add(a)
+        session.delete(o)
+        session.commit()
+        return {"status": "ok"}
+
+
+@app.post("/agents/{agent_id}/office")
+def assign_agent_to_office(agent_id: str, office_id: int | None = None) -> dict:
+    """Привязка агента к офису. office_id=null отвязывает."""
+    with Session(engine) as session:
+        a = session.exec(select(Agent).where(Agent.agent_id == agent_id)).first()
+        if a is None:
+            raise HTTPException(404, "агент не найден")
+        if office_id is not None:
+            o = session.exec(select(Office).where(Office.id == office_id)).first()
+            if o is None:
+                raise HTTPException(404, "офис не найден")
+        a.office_id = office_id
+        session.add(a)
+        session.commit()
+        return {"status": "ok", "agent_id": agent_id, "office_id": office_id}
+
+
 # ---------- Команда (overview всех агентов) ----------
 
 @app.get("/overview")
@@ -918,12 +1017,18 @@ def team_overview(hours: int = 24) -> dict:
                 except Exception:
                     pass
 
+            office = None
+            if a.office_id is not None:
+                o = session.exec(select(Office).where(Office.id == a.office_id)).first()
+                if o:
+                    office = {"office_id": o.id, "name": o.name, "city": o.city}
             result.append({
                 "agent_id": a.agent_id,
                 "hostname": a.hostname,
                 "username": a.username,
                 "online": online,
                 "last_seen": last_seen.isoformat(),
+                "office": office,
                 "active_meeting": (
                     {"started_at": _as_utc(active_by_agent[a.agent_id].started_at).isoformat(),
                      "client_name": active_by_agent[a.agent_id].client_name}
@@ -947,12 +1052,35 @@ def team_overview(hours: int = 24) -> dict:
             -x["meetings_count"],
         ))
 
+        # сводка по офисам
+        offices_summary: dict = {}
+        for r in result:
+            key = r["office"]["name"] if r["office"] else "(без офиса)"
+            if key not in offices_summary:
+                offices_summary[key] = {
+                    "name": key,
+                    "agents_total": 0,
+                    "agents_online": 0,
+                    "meetings_count": 0,
+                    "work_seconds": 0,
+                    "personal_seconds": 0,
+                    "red_flags_count": 0,
+                }
+            s = offices_summary[key]
+            s["agents_total"] += 1
+            if r["online"]: s["agents_online"] += 1
+            s["meetings_count"] += r["meetings_count"]
+            s["work_seconds"] += r["by_category"].get("work", 0)
+            s["personal_seconds"] += r["by_category"].get("personal", 0)
+            s["red_flags_count"] += r["red_flags_count"]
+
         return {
             "hours": hours,
             "now": now.isoformat(),
             "total_agents": len(result),
             "online_count": sum(1 for r in result if r["online"]),
             "agents": result,
+            "offices_summary": sorted(offices_summary.values(), key=lambda x: -x["agents_total"]),
         }
 
 
