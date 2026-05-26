@@ -558,6 +558,11 @@ def agent_activity_summary(agent_id: str, hours: int = 24, date: str | None = No
         idle_interval = sum(r.interval_seconds for r in idle_rows if r.idle_seconds > idle_threshold)
         active_interval = total_interval - idle_interval
 
+        # начало и конец работы — первый и последний активный сэмпл за период
+        active_samples = [r for r in idle_rows if r.idle_seconds <= idle_threshold]
+        first_at = min((r.captured_at for r in active_samples), default=None)
+        last_at = max((r.captured_at for r in active_samples), default=None)
+
         # клавиатура: агрегация по app
         ks_rows = session.exec(
             select(KeystrokeSample.app_name, func.sum(KeystrokeSample.keystroke_count))
@@ -579,6 +584,8 @@ def agent_activity_summary(agent_id: str, hours: int = 24, date: str | None = No
             "total_tracked_seconds": total_interval,
             "active_seconds": active_interval,
             "idle_seconds": idle_interval,
+            "first_activity_at": _as_utc(first_at).isoformat() if first_at else None,
+            "last_activity_at": _as_utc(last_at).isoformat() if last_at else None,
             "keystrokes_total": ks_total,
             "keystrokes_by_app": ks_by_app[:20],
         }

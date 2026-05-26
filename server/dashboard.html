@@ -796,7 +796,14 @@
 
     function renderActivityTiles(a) {
       if (!a) { $("#activityTiles").innerHTML = ""; return; }
+      const fmtHM = (iso) => {
+        if (!iso) return "—";
+        const d = new Date(iso);
+        return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+      };
       $("#activityTiles").innerHTML = `
+        <div class="day-tile work"><div class="label">начало работы</div><div class="value">${fmtHM(a.first_activity_at)}</div></div>
+        <div class="day-tile work"><div class="label">конец работы</div><div class="value">${fmtHM(a.last_activity_at)}</div></div>
         <div class="day-tile work"><div class="label">за компом</div><div class="value">${fmtSec(a.active_seconds || 0)}</div></div>
         <div class="day-tile personal"><div class="label">бездействие</div><div class="value">${fmtSec(a.idle_seconds || 0)}</div></div>
         <div class="day-tile neutral"><div class="label">всего символов</div><div class="value">${a.keystrokes_total || 0}</div></div>
