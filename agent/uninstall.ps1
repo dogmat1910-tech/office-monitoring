@@ -1,4 +1,4 @@
-# Деинсталляция office-monitoring agent.
+﻿# Деинсталляция office-monitoring agent.
 # Запуск (от админа):
 #   irm https://office.lkdzrkk.pro/uninstall.ps1 -UseBasicParsing | iex
 

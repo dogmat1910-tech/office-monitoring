@@ -1,4 +1,4 @@
-# office-monitoring agent installer for Windows (EXE-based).
+﻿# office-monitoring agent installer for Windows (EXE-based).
 # Запуск (от админа):
 #   irm https://office.lkdzrkk.pro/install.ps1 -UseBasicParsing | iex
 
@@ -89,7 +89,7 @@ start "" "$watchPath"
 
 # --- Scheduled Task: основной агент ---
 Info "Регистрирую Scheduled Task '$TaskAgent'..."
-schtasks.exe /Delete /TN $TaskAgent /F 2>$null | Out-Null
+Unregister-ScheduledTask -TaskName $TaskAgent -Confirm:$false -ErrorAction SilentlyContinue
 
 $action    = New-ScheduledTaskAction -Execute $runAgentBat
 $trigger   = New-ScheduledTaskTrigger -AtLogOn
@@ -104,7 +104,7 @@ Ok "Scheduled Task '$TaskAgent' создан"
 
 # --- Scheduled Task: watchdog (At-LogOn + каждые 15 мин) ---
 Info "Регистрирую Scheduled Task '$TaskWatch'..."
-schtasks.exe /Delete /TN $TaskWatch /F 2>$null | Out-Null
+Unregister-ScheduledTask -TaskName $TaskWatch -Confirm:$false -ErrorAction SilentlyContinue
 
 $actionW    = New-ScheduledTaskAction -Execute $runWatchBat
 $triggerW1  = New-ScheduledTaskTrigger -AtLogOn
