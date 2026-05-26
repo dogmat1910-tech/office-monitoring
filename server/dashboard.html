@@ -627,13 +627,14 @@
           </div>
           <div class="actions"><button class="btn-sim stop" data-stop="${a.agent_id}">⏹ остановить</button></div>` : `
           <div class="actions"><button class="btn-sim" data-start="${a.agent_id}">▶ симулировать встречу</button></div>`;
+        const label = a.display_name && a.display_name.trim() ? a.display_name : a.hostname;
         return `
           <div class="agent ${a.agent_id === selectedAgent ? 'selected' : ''}" data-id="${a.agent_id}">
             <div class="name">
-              <span class="dot ${a.online ? 'online' : 'offline'}"></span>${escapeHTML(a.hostname)}
+              <span class="dot ${a.online ? 'online' : 'offline'}"></span>${escapeHTML(label)}
               ${a.active_meeting ? '<span class="badge meeting">🔴 встреча</span>' : ''}
             </div>
-            <div class="meta">${escapeHTML(a.username)} · ${a.online ? 'online' : 'offline'}</div>
+            <div class="meta">${escapeHTML(a.hostname)} · ${escapeHTML(a.username)} · ${a.online ? 'online' : 'offline'}</div>
             ${meetingHtml}
           </div>`;
       }).join("");
@@ -1165,12 +1166,15 @@
           : (a.daily_status === "pending" ? "⏳" : "—");
         const rfCls = a.red_flags_count > 0 ? "" : "zero";
         const officeName = a.office ? a.office.name : "";
+        const displayLabel = a.display_name && a.display_name.trim() ? a.display_name : a.hostname;
+        const hostHint = a.display_name && a.display_name.trim() ? ` <span class="muted" style="font-size: 11px; font-weight: normal;">(${escapeHTML(a.hostname)})</span>` : "";
         return `
           <div class="team-row" data-id="${a.agent_id}">
             <div><span class="dot ${a.online ? 'online' : 'offline'}"></span></div>
             <div class="team-name">
-              ${escapeHTML(a.hostname)}${meetingBadge}
-              <span class="muted" style="font-size: 11px; cursor: pointer; margin-left: 6px;" onclick="event.stopPropagation(); window.openDiagnostics('${a.agent_id}')" title="диагностика">🩺</span>
+              ${escapeHTML(displayLabel)}${hostHint}${meetingBadge}
+              <span class="muted" style="font-size: 11px; cursor: pointer; margin-left: 6px;" onclick="event.stopPropagation(); window.renameAgent('${a.agent_id}', ${JSON.stringify(a.display_name || '').replace(/"/g, '&quot;')})" title="переименовать">✏️</span>
+              <span class="muted" style="font-size: 11px; cursor: pointer; margin-left: 4px;" onclick="event.stopPropagation(); window.openDiagnostics('${a.agent_id}')" title="диагностика">🩺</span>
               <div class="meta">${escapeHTML(a.username)} · ${a.online ? 'online' : 'offline'} ·
                 <select class="cat-select office-select" data-agent="${a.agent_id}" onclick="event.stopPropagation()">
                   ${officeOptions(officeName)}
@@ -1235,6 +1239,22 @@
     }
 
     // ───────────── Диагностика агента (модалка) ─────────────
+    window.renameAgent = async function(agentId, currentName) {
+      const newName = prompt("Имя менеджера (пусто = сбросить, показывать hostname):", currentName || "");
+      if (newName === null) return;  // отмена
+      const r = await fetch(`/agents/${agentId}/display_name`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ display_name: newName }),
+      });
+      if (!r.ok) {
+        alert(`Не удалось сохранить: ${r.status} ${await r.text()}`);
+        return;
+      }
+      loadTeamSummary();
+      loadAgents();
+    };
+
     window.openDiagnostics = async function(agentId) {
       const r = await fetch(`/agents/${agentId}/diagnostics`);
       const d = await r.json();

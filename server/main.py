@@ -56,6 +56,7 @@ class Agent(SQLModel, table=True):
     first_seen: datetime
     last_seen: datetime
     office_id: int | None = Field(default=None, index=True)
+    display_name: str | None = None  # ФИО менеджера для дашборда; если пусто — hostname
 
 
 class Heartbeat(SQLModel, table=True):
@@ -593,6 +594,7 @@ def list_agents() -> list[dict]:
                 "agent_id": a.agent_id,
                 "hostname": a.hostname,
                 "username": a.username,
+                "display_name": a.display_name,
                 "first_seen": first_seen.isoformat(),
                 "last_seen": last_seen.isoformat(),
                 "online": (now - last_seen).total_seconds() < 60,
@@ -606,6 +608,23 @@ def list_agents() -> list[dict]:
                 ),
             })
         return result
+
+
+class AgentDisplayNameIn(BaseModel):
+    display_name: str | None = None  # пустая строка / None сбрасывает имя
+
+
+@app.post("/agents/{agent_id}/display_name")
+def set_agent_display_name(agent_id: str, payload: AgentDisplayNameIn) -> dict:
+    with Session(engine) as session:
+        agent = session.exec(select(Agent).where(Agent.agent_id == agent_id)).first()
+        if not agent:
+            raise HTTPException(404, "agent not found")
+        new_name = (payload.display_name or "").strip() or None
+        agent.display_name = new_name
+        session.add(agent)
+        session.commit()
+        return {"agent_id": agent_id, "display_name": new_name}
 
 
 @app.post("/window_samples")
@@ -1307,6 +1326,7 @@ def team_overview(hours: int = 24, date: str | None = None) -> dict:
                 "agent_id": a.agent_id,
                 "hostname": a.hostname,
                 "username": a.username,
+                "display_name": a.display_name,
                 "online": online,
                 "last_seen": last_seen.isoformat(),
                 "office": office,
