@@ -1,6 +1,6 @@
 # Деинсталляция office-monitoring agent.
 # Запуск (от админа):
-#   irm https://raw.githubusercontent.com/dogmat1910-tech/office-monitoring/main/agent/uninstall.ps1 -UseBasicParsing | iex
+#   irm https://office.lkdzrkk.pro/uninstall.ps1 -UseBasicParsing | iex
 
 $ErrorActionPreference = "SilentlyContinue"
 
@@ -22,9 +22,13 @@ foreach ($t in @($TaskAgent, $TaskWatch, $TaskLegacy)) {
     Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
 }
 
-Write-Host "[*] Убиваю процессы python*.exe из $InstallDir..."
+Write-Host "[*] Убиваю процессы агента и watchdog..."
+Get-Process -Name "office-monitoring-agent","office-monitoring-watchdog" -ErrorAction SilentlyContinue |
+    Stop-Process -Force -ErrorAction SilentlyContinue
+# legacy: предыдущая Python-версия инсталлера
 Get-Process pythonw, python -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -like "$InstallDir*" } | Stop-Process -Force
+    Where-Object { $_.Path -like "$InstallDir*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
 
 foreach ($t in @($TaskAgent, $TaskWatch, $TaskLegacy)) {
     Write-Host "[*] Удаляю задачу $t..."

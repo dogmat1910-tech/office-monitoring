@@ -1,6 +1,6 @@
 # office-monitoring agent installer for Windows (EXE-based).
 # Запуск (от админа):
-#   irm https://raw.githubusercontent.com/dogmat1910-tech/office-monitoring/main/agent/installer.ps1 -UseBasicParsing | iex
+#   irm https://office.lkdzrkk.pro/install.ps1 -UseBasicParsing | iex
 
 $ErrorActionPreference = "Stop"
 
@@ -9,9 +9,13 @@ $InstallDir  = "C:\Program Files\office-monitoring"
 $DataDir     = "C:\ProgramData\office-monitoring"
 $TaskAgent   = "OfficeMonitoring"
 $TaskWatch   = "OfficeMonitoringWatchdog"
-$ReleaseBase = "https://github.com/dogmat1910-tech/office-monitoring/releases/latest/download"
+# Качаем .exe с того же домена, что и сервер — в корп-сетках github.com часто заблочен.
+# Сервер раздаёт /agent.exe и /watchdog.exe из /opt/office-monitoring/public через Caddy.
+$ReleaseBase = $ServerUrl
 $AgentExe    = "office-monitoring-agent.exe"
 $WatchExe    = "office-monitoring-watchdog.exe"
+$AgentUrl    = "$ReleaseBase/agent.exe"
+$WatchUrl    = "$ReleaseBase/watchdog.exe"
 
 function Info($m)  { Write-Host "[*] $m" -ForegroundColor Cyan }
 function Ok($m)    { Write-Host "[+] $m" -ForegroundColor Green }
@@ -45,16 +49,16 @@ Get-Process -Name "office-monitoring-agent","office-monitoring-watchdog" -ErrorA
 Start-Sleep -Seconds 2
 
 # --- Скачиваем .exe ---
-Info "Скачиваю $AgentExe..."
+Info "Скачиваю $AgentExe с $AgentUrl..."
 $agentPath = Join-Path $InstallDir $AgentExe
-Invoke-WebRequest -Uri "$ReleaseBase/$AgentExe" -OutFile $agentPath -UseBasicParsing
+Invoke-WebRequest -Uri $AgentUrl -OutFile $agentPath -UseBasicParsing
 Unblock-File -Path $agentPath
 $agentSize = [math]::Round((Get-Item $agentPath).Length / 1MB, 1)
 Ok "  $AgentExe ($agentSize MB)"
 
-Info "Скачиваю $WatchExe..."
+Info "Скачиваю $WatchExe с $WatchUrl..."
 $watchPath = Join-Path $InstallDir $WatchExe
-Invoke-WebRequest -Uri "$ReleaseBase/$WatchExe" -OutFile $watchPath -UseBasicParsing
+Invoke-WebRequest -Uri $WatchUrl -OutFile $watchPath -UseBasicParsing
 Unblock-File -Path $watchPath
 $watchSize = [math]::Round((Get-Item $watchPath).Length / 1MB, 1)
 Ok "  $WatchExe ($watchSize MB)"
@@ -151,4 +155,4 @@ Write-Host "  Get-ScheduledTask -TaskName $TaskAgent,$TaskWatch | Get-ScheduledT
 Write-Host "  Get-Content '$DataDir\agent.log' -Tail 20 -Wait -Encoding UTF8"
 Write-Host ""
 Write-Host "Деинсталляция:"
-Write-Host "  irm https://raw.githubusercontent.com/dogmat1910-tech/office-monitoring/main/agent/uninstall.ps1 -UseBasicParsing | iex"
+Write-Host "  irm https://office.lkdzrkk.pro/uninstall.ps1 -UseBasicParsing | iex"
