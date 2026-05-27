@@ -21,7 +21,7 @@ from sqlmodel import Session, select
 from analyze import _extract_json
 from llm_retry import with_llm_retry
 from main import Conversation, Meeting, WindowSample, engine, _as_utc
-from prompts import build_checklist_text, build_errors_text
+from prompts import build_all_checklists_text, build_errors_text, CHECKLIST_LABELS
 
 log = logging.getLogger("worker")
 
@@ -75,16 +75,19 @@ SYSTEM_PROMPT = """\
 
 При неоднозначности предпочитай менее обвинительный класс.
 
-## Шаг 2: если is_sale_attempt=true — оцени по чеклисту
+## Шаг 2: если is_with_client=true — определи сценарий и оцени по чеклисту
 
-Используй ТОТ ЖЕ чеклист что и для кнопочных встреч:
+Сценарии:
+- **appointment** — назначение встречи в офис (не продаёт сейчас)
+- **primary_sale** — первая продажа (первый контакт)
+- **secondary_sale** — дожим (повторный контакт)
 
-{CHECKLIST_TEXT}
+{ALL_CHECKLISTS_TEXT}
 
 ГРУБЫЕ ОШИБКИ (отмечай отдельно):
 {ERRORS_TEXT}
 
-Для каждого пункта чеклиста ставь "yes" / "no" / "n/a" и короткий комментарий.
+Для каждого пункта ставь "yes" / "no" / "n/a" и короткий комментарий.
 
 ### ОЦЕНКА sale_quality_score:
 - Считай: yes = 1 балл, no = 0, n/a = не считается.
@@ -92,7 +95,7 @@ SYSTEM_PROMPT = """\
 - 0-3: провал, 4-6: слабо, 7-8: хорошо, 9-10: отлично.
 
 Отвечай строго JSON-объектом без markdown.\
-""".replace("{CHECKLIST_TEXT}", build_checklist_text()).replace("{ERRORS_TEXT}", build_errors_text())
+""".replace("{ALL_CHECKLISTS_TEXT}", build_all_checklists_text()).replace("{ERRORS_TEXT}", build_errors_text())
 
 
 def build_user_prompt(conv) -> str:
@@ -118,17 +121,16 @@ def build_user_prompt(conv) -> str:
   "confidence": <число 0-1>,
   "summary": "<2-3 предложения о чём шёл разговор>",
   "is_with_client": <true|false>,
+  "scenario": "appointment | primary_sale | secondary_sale | null (если не с клиентом)",
   "is_sale_attempt": <true|false>,
   "is_sale_closed": <true|false>,
-  "sale_quality_score": <число 0-10 если is_sale_attempt, иначе null>,
+  "sale_quality_score": <число 0-10 если is_with_client, иначе null>,
   "checklist": {{
-    "1.1": {{"status": "yes|no|n/a", "comment": "короткий комментарий"}},
-    "1.2": {{"status": "...", "comment": "..."}},
-    "2.1": {{"status": "...", "comment": "..."}},
-    // ... все пункты из чеклиста выше
+    "<код пункта из чеклиста сценария>": {{"status": "yes|no|n/a", "comment": "..."}},
+    // все пункты выбранного сценария (A1.1... или P1.1... или S1.1...)
   }},
   "key_observations": ["<заметные моменты>"],
-  "critical_errors": ["<серьёзные ошибки менеджера>"],
+  "critical_errors": [{{"type": "название ошибки", "quote": "цитата из транскрипта"}}],
   "recommendation": "<конкретная рекомендация менеджеру, 1-2 предложения>"
 }}
 
