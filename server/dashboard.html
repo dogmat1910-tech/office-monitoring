@@ -1040,17 +1040,28 @@
           row.classList.add("expanded");
 
           let checklistHtml = "";
-          if (c.checklist && c.checklist.length) {
-            const statusIcon = {"done": "✅", "partial": "⚠️", "missed": "❌", "n/a": "⬜"};
-            const statusColor = {"done": "#4ade80", "partial": "#fbbf24", "missed": "#f87171", "n/a": "#666"};
+          const cl = c.checklist;
+          if (cl && typeof cl === "object") {
+            const sIcon = {"yes": "✅", "done": "✅", "no": "❌", "missed": "❌", "partial": "⚠️", "n/a": "⬜"};
+            const sColor = {"yes": "#4ade80", "done": "#4ade80", "no": "#f87171", "missed": "#f87171", "partial": "#fbbf24", "n/a": "#666"};
+            let rows = "";
+            if (Array.isArray(cl)) {
+              // Старый формат: [{step, name, status, comment}]
+              rows = cl.map(s => `<tr>
+                <td style="width:24px; color:${sColor[s.status] || '#888'}">${sIcon[s.status] || "?"}</td>
+                <td style="width:180px; font-weight:600;">${s.step || ""}. ${escapeHTML(s.name || "")}</td>
+                <td style="color:${sColor[s.status] || '#888'}">${escapeHTML(s.comment || "")}</td>
+              </tr>`).join("");
+            } else {
+              // Новый формат: {"1.1": {status, comment}, "1.2": ...}
+              rows = Object.entries(cl).map(([key, v]) => `<tr>
+                <td style="width:24px; color:${sColor[v.status] || '#888'}">${sIcon[v.status] || "?"}</td>
+                <td style="width:50px; font-weight:600;">${escapeHTML(key)}</td>
+                <td style="color:${sColor[v.status] || '#888'}">${escapeHTML(v.comment || "")}</td>
+              </tr>`).join("");
+            }
             checklistHtml = `<div style="margin-top:12px;"><strong>Чеклист встречи:</strong></div>
-              <table style="width:100%; margin-top:6px; font-size:12px;">
-              ${c.checklist.map(s => `<tr>
-                <td style="width:24px; color:${statusColor[s.status] || '#888'}">${statusIcon[s.status] || "?"}</td>
-                <td style="width:180px; font-weight:600;">${s.step}. ${escapeHTML(s.name)}</td>
-                <td style="color:${statusColor[s.status] || '#888'}">${escapeHTML(s.comment || "")}</td>
-              </tr>`).join("")}
-              </table>`;
+              <table style="width:100%; margin-top:6px; font-size:12px;">${rows}</table>`;
           }
 
           const scoreHtml = c.sale_quality_score != null
@@ -1058,7 +1069,10 @@
             : "";
 
           const errorsHtml = (c.critical_errors || []).length
-            ? `<div style="margin-top:8px; color:#f87171;"><strong>Критичные ошибки:</strong></div><ul style="font-size:12px;">${c.critical_errors.map(e => `<li>${escapeHTML(e)}</li>`).join("")}</ul>`
+            ? `<div style="margin-top:8px; color:#f87171;"><strong>Критичные ошибки:</strong></div><ul style="font-size:12px;">${c.critical_errors.map(e => {
+                if (typeof e === "string") return `<li>${escapeHTML(e)}</li>`;
+                return `<li><strong>${escapeHTML(e.type || "")}</strong>${e.quote ? `: «${escapeHTML(e.quote)}»` : ""}</li>`;
+              }).join("")}</ul>`
             : "";
 
           const recHtml = c.recommendation
