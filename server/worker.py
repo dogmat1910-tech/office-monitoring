@@ -25,7 +25,9 @@ from analyze_conversation import analyze_conversation
 from classify_voice import auto_bind_meeting_id, classify_voice_segment
 from conversations import cluster_pending_segments, get_active_agents_with_pending_segments
 from daily_report import generate_daily_report
-from diarization import diarize_conversation
+# diarization через pyannote больше не нужен — Gemini 2.5 Flash сам
+# разделяет по ролям (Менеджер/Клиент) прямо в транскрипте.
+# from diarization import diarize_conversation
 from ocr import ocr_image
 from transcribe import transcribe_meeting, transcribe_voice_segment
 
@@ -435,12 +437,12 @@ def process_one() -> bool:
         process_conversation_analysis(conv_id)
         return True
 
-    # Этап 2.9: speaker diarization для conversation
-    if os.environ.get("OM_ENABLE_DIARIZATION", "1") == "1":
-        conv_id = find_pending_diarization()
-        if conv_id is not None:
-            process_diarization(conv_id)
-            return True
+    # Этап 2.9: speaker diarization — отключен, Gemini делает это в транскрипте
+    # if os.environ.get("OM_ENABLE_DIARIZATION", "1") == "1":
+    #     conv_id = find_pending_diarization()
+    #     if conv_id is not None:
+    #         process_diarization(conv_id)
+    #         return True
 
     # Этап 2.95: OCR скриншотов
     scr_id = find_pending_ocr()
