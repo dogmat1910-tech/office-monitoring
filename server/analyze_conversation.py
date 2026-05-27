@@ -122,6 +122,7 @@ def build_user_prompt(conv) -> str:
   "summary": "<2-3 предложения о чём шёл разговор>",
   "is_with_client": <true|false>,
   "scenario": "appointment | primary_sale | secondary_sale | null (если не с клиентом)",
+  "audio_type": "full | one_sided",
   "is_sale_attempt": <true|false>,
   "is_sale_closed": <true|false>,
   "sale_quality_score": <число 0-10 если is_with_client, иначе null>,
