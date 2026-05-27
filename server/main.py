@@ -2441,6 +2441,10 @@ def list_conversations(agent_id: str, hours: int = 24, date: str | None = None, 
                 "related_meeting_id": c.related_meeting_id,
                 "sync_status": c.sync_status,
                 "analyzed_at": _as_utc(c.analyzed_at).isoformat() if c.analyzed_at else None,
+                "checklist": (json.loads(c.payload_json) if c.payload_json else {}).get("checklist", []),
+                "key_observations": (json.loads(c.payload_json) if c.payload_json else {}).get("key_observations", []),
+                "critical_errors": (json.loads(c.payload_json) if c.payload_json else {}).get("critical_errors", []),
+                "recommendation": (json.loads(c.payload_json) if c.payload_json else {}).get("recommendation"),
             }
             for c in rows
         ]
