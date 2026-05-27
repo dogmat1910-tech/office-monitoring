@@ -39,6 +39,8 @@ logging.basicConfig(
 log = logging.getLogger("worker")
 
 POLL_INTERVAL = int(os.environ.get("OM_WORKER_POLL_INTERVAL", "10"))
+# Worker scope: "all" (default), "transcribe" (транскрибация + OCR), "analyze" (LLM + daily)
+WORKER_MODE = os.environ.get("OM_WORKER_MODE", "all")
 
 
 def find_pending_transcription() -> int | None:
@@ -387,10 +389,14 @@ def get_transcript_text(meeting_id: int) -> str | None:
         return t.text if t else None
 
 
+def _is_mode(*allowed: str) -> bool:
+    return WORKER_MODE == "all" or WORKER_MODE in allowed
+
+
 def process_one() -> bool:
-    """Обрабатывает одну задачу. Транскрипция приоритетнее анализа."""
-    # Этап 1: транскрипция
-    meeting_id = find_pending_transcription()
+    """Обрабатывает одну задачу. WORKER_MODE фильтрует scope."""
+    # Этап 1: транскрипция встреч (scope: transcribe)
+    meeting_id = find_pending_transcription() if _is_mode("transcribe") else None
     if meeting_id is not None:
         paths = get_chunk_paths(meeting_id)
         if not paths:
@@ -413,26 +419,26 @@ def process_one() -> bool:
             })
             return True
 
-    # Этап 2: транскрипция voice-сегментов (always-on)
-    seg_id = find_pending_voice_segment()
+    # Этап 2: транскрипция voice-сегментов (scope: transcribe)
+    seg_id = find_pending_voice_segment() if _is_mode("transcribe") else None
     if seg_id is not None:
         process_voice_segment(seg_id)
         return True
 
-    # Этап 2.5: классификация транскрибированных, но ещё не классифицированных сегментов
-    seg_id = find_pending_voice_classification()
+    # Этап 2.5: LLM-классификация voice (scope: analyze)
+    seg_id = find_pending_voice_classification() if _is_mode("analyze") else None
     if seg_id is not None:
         process_voice_classification(seg_id)
         return True
 
-    # Этап 2.7: кластеризация сегментов в conversations
-    for agent_id in get_active_agents_with_pending_segments():
+    # Этап 2.7: кластеризация (scope: analyze)
+    for agent_id in (get_active_agents_with_pending_segments() if _is_mode("analyze") else []):
         n = cluster_pending_segments(agent_id)
         if n:
             return True  # делаем по одному агенту за итерацию
 
-    # Этап 2.8: LLM-анализ conversation целиком
-    conv_id = find_pending_conversation_analysis()
+    # Этап 2.8: LLM-анализ conversation (scope: analyze)
+    conv_id = find_pending_conversation_analysis() if _is_mode("analyze") else None
     if conv_id is not None:
         process_conversation_analysis(conv_id)
         return True
@@ -444,20 +450,20 @@ def process_one() -> bool:
     #         process_diarization(conv_id)
     #         return True
 
-    # Этап 2.95: OCR скриншотов
-    scr_id = find_pending_ocr()
+    # Этап 2.95: OCR скриншотов (scope: transcribe)
+    scr_id = find_pending_ocr() if _is_mode("transcribe") else None
     if scr_id is not None:
         process_ocr(scr_id)
         return True
 
-    # Этап 3: pending daily reports
-    pending_report = find_pending_daily_report()
+    # Этап 3: daily reports (scope: analyze)
+    pending_report = find_pending_daily_report() if _is_mode("analyze") else None
     if pending_report is not None:
         process_daily_report(pending_report)
         return True
 
-    # Этап 4: LLM-анализ встреч
-    meeting_id = find_pending_analysis()
+    # Этап 4: LLM-анализ встреч (scope: analyze)
+    meeting_id = find_pending_analysis() if _is_mode("analyze") else None
     if meeting_id is not None:
         text = get_transcript_text(meeting_id)
         if not text:
@@ -486,8 +492,8 @@ def process_one() -> bool:
 
 
 def main() -> None:
-    log.info("worker starting, poll_interval=%d s, transcribe_backend=%s",
-             POLL_INTERVAL, os.environ.get("OM_TRANSCRIBE_BACKEND", "whisper"))
+    log.info("worker starting: mode=%s, poll_interval=%d s, transcribe_backend=%s",
+             WORKER_MODE, POLL_INTERVAL, os.environ.get("OM_TRANSCRIBE_BACKEND", "whisper"))
     log.info("worker готов, ждём данные")
 
     while True:

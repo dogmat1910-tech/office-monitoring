@@ -17,6 +17,7 @@ import time
 
 import httpx
 
+from llm_retry import with_llm_retry
 from prompts import SYSTEM_PROMPT, build_user_prompt
 
 log = logging.getLogger("worker")
@@ -36,30 +37,34 @@ def analyze_transcript(transcript: str) -> dict:
 
     user_prompt = build_user_prompt(transcript)
     log.info("analyze: model=%s transcript_len=%d", MODEL, len(transcript))
-    t0 = time.monotonic()
 
-    r = httpx.post(
-        OPENROUTER_URL,
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "HTTP-Referer": "https://office.lkdzrkk.pro",
-            "X-Title": "office-monitoring",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": MODEL,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.2,
-            "max_tokens": 2500,
-            "response_format": {"type": "json_object"},
-        },
-        timeout=120.0,
-    )
-    r.raise_for_status()
-    data = r.json()
+    @with_llm_retry
+    def _call_llm():
+        resp = httpx.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "HTTP-Referer": "https://office.lkdzrkk.pro",
+                "X-Title": "office-monitoring",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MODEL,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 2500,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=120.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    t0 = time.monotonic()
+    data = _call_llm()
 
     content = data["choices"][0]["message"]["content"]
     usage = data.get("usage", {})

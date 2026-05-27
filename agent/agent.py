@@ -14,6 +14,7 @@ import hashlib
 import logging
 import os
 import platform
+import signal
 import socket
 import sys
 import time
@@ -50,10 +51,14 @@ LOG_DIR = Path(os.environ.get("OM_LOG_DIR", str(Path.home() / ".office-monitorin
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "agent.log"
 
+from logging.handlers import RotatingFileHandler
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
+    handlers=[
+        RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 # глушим debug-логи httpx — слишком много шума на каждый запрос
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -407,7 +412,19 @@ def main() -> None:
             if not always_on.start():
                 log.warning("always-on не запустился — продолжаем без него")
                 always_on = None
-        while True:
+
+        # Graceful shutdown — flush буферы при SIGTERM/SIGINT вместо потери данных
+        _shutdown_requested = False
+
+        def _handle_shutdown(signum, frame):
+            nonlocal _shutdown_requested
+            log.info("graceful shutdown: signal %d, flush буферов...", signum)
+            _shutdown_requested = True
+
+        signal.signal(signal.SIGTERM, _handle_shutdown)
+        signal.signal(signal.SIGINT, _handle_shutdown)
+
+        while not _shutdown_requested:
             window = get_active_window()
             if window is not None:
                 current_window.clear()
@@ -561,3 +578,13 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         log.info("agent stopped by user")
+    finally:
+        log.info("agent cleanup: flushing buffers...")
+        if keystroke_agg is not None:
+            keystroke_agg.stop()
+        if always_on is not None:
+            try:
+                always_on.stop()
+            except Exception:
+                pass
+        log.info("agent stopped cleanly")

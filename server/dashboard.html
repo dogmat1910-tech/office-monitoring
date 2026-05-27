@@ -453,6 +453,7 @@
             </label>
             <label class="muted"><input type="checkbox" id="teamGroupByOffice" checked> группировать</label>
             <button class="btn-sim" id="teamManageOffices">⚙ офисы</button>
+            <button class="btn-sim" id="teamExportCsv" style="background: #1e6b3a;">📥 CSV</button>
           </div>
           <div id="teamOfficesSummary" class="day-summary" style="grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));"></div>
           <div id="teamTable"></div>
@@ -511,6 +512,20 @@
       <div class="tab-content" data-tab-content="screenshots" hidden>
         <div class="panel">
           <h2>Скриншоты при заходе на личные/нейтральные сайты</h2>
+          <div style="display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap;">
+            <label class="muted">Категория:
+              <select id="scrFilterCategory" style="background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; font-size: 13px;">
+                <option value="">все</option>
+                <option value="personal">только personal</option>
+                <option value="neutral">только neutral</option>
+                <option value="work">только work</option>
+              </select>
+            </label>
+            <label class="muted">OCR поиск:
+              <input type="text" id="scrFilterOcr" placeholder="текст на скриншоте..." style="background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; font-size: 13px; width: 220px;">
+            </label>
+            <span id="scrFilterCount" class="muted" style="font-size: 12px;"></span>
+          </div>
           <div id="screenshotsGrid"></div>
         </div>
       </div>
@@ -762,13 +777,44 @@
       $("#updated").textContent = `${scope} · обновлено ${fmtDateTime(new Date().toISOString())}`;
     }
 
+    let allScreenshots = [];
+
     function renderScreenshots(items) {
+      allScreenshots = items;
+      applyScreenshotFilters();
+    }
+
+    function applyScreenshotFilters() {
       const el = $("#screenshotsGrid");
-      if (!items.length) {
-        el.innerHTML = '<div class="empty">скриншотов нет (нужно зайти на personal/neutral сайт)</div>';
+      const catFilter = ($("#scrFilterCategory") || {}).value || "";
+      const ocrQuery = ($("#scrFilterOcr") || {}).value || "";
+      const ocrLower = ocrQuery.toLowerCase().trim();
+
+      let filtered = allScreenshots;
+      if (catFilter) {
+        filtered = filtered.filter(s => (s.category || "neutral") === catFilter);
+      }
+      if (ocrLower) {
+        filtered = filtered.filter(s => s.ocr_text && s.ocr_text.toLowerCase().includes(ocrLower));
+      }
+
+      const countEl = $("#scrFilterCount");
+      if (countEl) {
+        if (catFilter || ocrLower) {
+          countEl.textContent = `показано ${filtered.length} из ${allScreenshots.length}`;
+        } else {
+          countEl.textContent = `всего: ${allScreenshots.length}`;
+        }
+      }
+
+      if (!filtered.length) {
+        const msg = allScreenshots.length
+          ? "нет скриншотов, подходящих под фильтр"
+          : "скриншотов нет (нужно зайти на personal/neutral сайт)";
+        el.innerHTML = `<div class="empty">${msg}</div>`;
         return;
       }
-      el.innerHTML = `<div class="scr-grid">${items.map(s => {
+      el.innerHTML = `<div class="scr-grid">${filtered.map(s => {
         const cat = s.category || 'neutral';
         const ocr = s.ocr_text ? s.ocr_text.slice(0, 200) : (s.ocr_done ? "(текст не распознан)" : "⏳ OCR в очереди");
         return `<div class="scr-card">
@@ -1797,6 +1843,19 @@
     });
 
     applyDateMode();
+
+    // CSV export button
+    $("#teamExportCsv").addEventListener("click", () => {
+      window.location.href = `/export_team_csv?${rangeQuery()}`;
+    });
+
+    // Screenshot filters
+    $("#scrFilterCategory").addEventListener("change", applyScreenshotFilters);
+    let scrOcrTimer = null;
+    $("#scrFilterOcr").addEventListener("input", () => {
+      clearTimeout(scrOcrTimer);
+      scrOcrTimer = setTimeout(applyScreenshotFilters, 300);
+    });
 
     loadAgents();
     setInterval(() => {

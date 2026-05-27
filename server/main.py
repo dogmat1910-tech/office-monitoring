@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlmodel import Field, Session, SQLModel, create_engine, select
@@ -493,20 +493,47 @@ def _as_utc(dt: datetime) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-# Локальный таймзон сервера: для прода вынести в env или брать из Office.timezone
-LOCAL_TZ_OFFSET = timedelta(hours=3)  # UTC+3 (Москва)
+# Дефолтный offset для таймзоны. Используется когда агент не привязан к офису
+# с явным timezone, или для глобальных эндпоинтов (/overview).
+DEFAULT_TZ_OFFSET_HOURS = int(os.environ.get("OM_DEFAULT_TZ_OFFSET", "3"))
 
 
-def _time_range(date: str | None, hours: int) -> tuple[datetime, datetime]:
+def _tz_offset_for_agent(agent_id: str | None = None) -> timedelta:
+    """Возвращает UTC-offset для конкретного агента (через его Office.timezone),
+    или дефолт если не привязан."""
+    if agent_id:
+        try:
+            with Session(engine) as session:
+                agent = session.exec(select(Agent).where(Agent.agent_id == agent_id)).first()
+                if agent and agent.office_id is not None:
+                    office = session.exec(select(Office).where(Office.id == agent.office_id)).first()
+                    if office and office.timezone:
+                        try:
+                            from zoneinfo import ZoneInfo
+                            tz = ZoneInfo(office.timezone)
+                            # Текущий UTC-offset для этой зоны (учитывает DST)
+                            now_utc = datetime.now(timezone.utc)
+                            offset = now_utc.astimezone(tz).utcoffset()
+                            if offset is not None:
+                                return offset
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    return timedelta(hours=DEFAULT_TZ_OFFSET_HOURS)
+
+
+def _time_range(date: str | None, hours: int, agent_id: str | None = None) -> tuple[datetime, datetime]:
     """Возвращает [start, end) в UTC.
-    - date=YYYY-MM-DD: весь день этой даты (00:00 - 24:00 локального времени)
+    - date=YYYY-MM-DD: весь день этой даты (00:00 - 24:00 локального времени офиса агента)
     - date=None: последние hours часов от сейчас."""
     if date:
         try:
             d = datetime.fromisoformat(date)
         except ValueError:
             raise HTTPException(400, f"date должен быть YYYY-MM-DD, получено {date!r}")
-        start = (d - LOCAL_TZ_OFFSET).replace(tzinfo=timezone.utc)
+        tz_offset = _tz_offset_for_agent(agent_id)
+        start = (d - tz_offset).replace(tzinfo=timezone.utc)
         end = start + timedelta(days=1)
         return start, end
     now = datetime.now(timezone.utc)
@@ -1810,6 +1837,247 @@ def team_overview(hours: int = 24, date: str | None = None) -> dict:
             "agents": result,
             "offices_summary": sorted(offices_summary.values(), key=lambda x: -x["agents_total"]),
         }
+
+
+# ---------- CSV Export ----------
+
+@app.get("/agents/{agent_id}/export_csv")
+def export_agent_csv(agent_id: str, hours: int = 24, date: str | None = None):
+    """CSV-экспорт данных одного агента за период."""
+    import csv
+    import io
+
+    since, until = _time_range(date, hours)
+    date_str = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    with Session(engine) as session:
+        agent = session.exec(select(Agent).where(Agent.agent_id == agent_id)).first()
+        if not agent:
+            raise HTTPException(404, "agent not found")
+
+        app_map = get_category_map(session)
+        domain_map = get_domain_category_map(session)
+
+        # day_summary data
+        samples = session.exec(
+            select(WindowSample.app_name, WindowSample.title, WindowSample.duration_seconds)
+            .where(WindowSample.agent_id == agent_id)
+            .where(WindowSample.captured_at >= since)
+            .where(WindowSample.captured_at < until)
+        ).all()
+        by_category: dict[str, int] = {"work": 0, "personal": 0, "neutral": 0}
+        for app_name, title, secs in samples:
+            _, cat, _ = categorize_sample(app_name, title, app_map, domain_map)
+            by_category[cat] = by_category.get(cat, 0) + int(secs or 0)
+
+        # meetings
+        meetings = session.exec(
+            select(Meeting)
+            .where(Meeting.agent_id == agent_id)
+            .where(Meeting.ended_at.is_not(None))
+            .where(Meeting.ended_at >= since)
+            .where(Meeting.ended_at < until)
+        ).all()
+        meeting_seconds = sum(
+            int((_as_utc(m.ended_at) - _as_utc(m.started_at)).total_seconds())
+            for m in meetings if m.ended_at
+        )
+
+        # activity_summary data
+        idle_rows = session.exec(
+            select(IdleSample)
+            .where(IdleSample.agent_id == agent_id)
+            .where(IdleSample.captured_at >= since)
+            .where(IdleSample.captured_at < until)
+        ).all()
+        total_interval = sum(r.interval_seconds for r in idle_rows)
+        idle_interval = sum(r.interval_seconds for r in idle_rows if r.idle_seconds > 60)
+        active_interval = total_interval - idle_interval
+        active_samples = [r for r in idle_rows if r.idle_seconds <= 60]
+        first_at = min((r.captured_at for r in active_samples), default=None)
+        last_at = max((r.captured_at for r in active_samples), default=None)
+
+        # keystrokes
+        ks_rows = session.exec(
+            select(func.sum(KeystrokeSample.keystroke_count))
+            .where(KeystrokeSample.agent_id == agent_id)
+            .where(KeystrokeSample.captured_at >= since)
+            .where(KeystrokeSample.captured_at < until)
+        ).first()
+        ks_total = int(ks_rows or 0)
+
+        # daily score
+        today_str = date if date else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        daily = session.exec(
+            select(DailyReport)
+            .where(DailyReport.agent_id == agent_id, DailyReport.report_date == today_str)
+        ).first()
+        daily_score = daily.productivity_score if daily and daily.status == "done" else None
+
+        row = {
+            "agent_id": agent_id,
+            "hostname": agent.hostname,
+            "display_name": agent.display_name or agent.hostname,
+            "date": date_str,
+            "work_seconds": by_category.get("work", 0),
+            "personal_seconds": by_category.get("personal", 0),
+            "neutral_seconds": by_category.get("neutral", 0),
+            "meeting_seconds": meeting_seconds,
+            "meetings_count": len(meetings),
+            "active_seconds": active_interval,
+            "idle_seconds": idle_interval,
+            "keystrokes_total": ks_total,
+            "first_activity_at": _as_utc(first_at).isoformat() if first_at else "",
+            "last_activity_at": _as_utc(last_at).isoformat() if last_at else "",
+            "daily_score": daily_score if daily_score is not None else "",
+        }
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(row.keys()))
+    writer.writeheader()
+    writer.writerow(row)
+    buf.seek(0)
+
+    filename = f"agent-{agent_id}-{date_str}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/export_team_csv")
+def export_team_csv(hours: int = 24, date: str | None = None):
+    """Сводный CSV по всем агентам (одна строка на агента)."""
+    import csv
+    import io
+
+    since, until = _time_range(date, hours)
+    date_str = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_str = date if date else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    with Session(engine) as session:
+        agents = session.exec(select(Agent).order_by(Agent.last_seen.desc())).all()
+        if not agents:
+            buf = io.StringIO()
+            buf.write("no agents\n")
+            buf.seek(0)
+            return StreamingResponse(
+                iter([buf.getvalue()]),
+                media_type="text/csv",
+                headers={"Content-Disposition": f'attachment; filename="team-{date_str}.csv"'},
+            )
+
+        app_map = get_category_map(session)
+        domain_map = get_domain_category_map(session)
+
+        # Batch: all WindowSamples
+        all_samples = session.exec(
+            select(WindowSample.agent_id, WindowSample.app_name, WindowSample.title, WindowSample.duration_seconds)
+            .where(WindowSample.captured_at >= since)
+            .where(WindowSample.captured_at < until)
+        ).all()
+        cats_by_agent: dict[str, dict[str, int]] = {}
+        for aid, app_name, title, secs in all_samples:
+            _, cat, _ = categorize_sample(app_name, title, app_map, domain_map)
+            cats_by_agent.setdefault(aid, {"work": 0, "personal": 0, "neutral": 0})
+            cats_by_agent[aid][cat] = cats_by_agent[aid].get(cat, 0) + int(secs or 0)
+
+        # Batch: all Meetings
+        all_meetings = session.exec(
+            select(Meeting)
+            .where(Meeting.ended_at.is_not(None))
+            .where(Meeting.ended_at >= since)
+            .where(Meeting.ended_at < until)
+        ).all()
+        meetings_by_agent: dict[str, list] = {}
+        for m in all_meetings:
+            meetings_by_agent.setdefault(m.agent_id, []).append(m)
+
+        # Batch: all IdleSamples
+        all_idle = session.exec(
+            select(IdleSample)
+            .where(IdleSample.captured_at >= since)
+            .where(IdleSample.captured_at < until)
+        ).all()
+        idle_by_agent: dict[str, list] = {}
+        for r in all_idle:
+            idle_by_agent.setdefault(r.agent_id, []).append(r)
+
+        # Batch: all KeystrokeSamples
+        all_ks = session.exec(
+            select(KeystrokeSample.agent_id, func.sum(KeystrokeSample.keystroke_count))
+            .where(KeystrokeSample.captured_at >= since)
+            .where(KeystrokeSample.captured_at < until)
+            .group_by(KeystrokeSample.agent_id)
+        ).all()
+        ks_by_agent = {aid: int(cnt or 0) for aid, cnt in all_ks}
+
+        # Batch: all DailyReports
+        all_daily = session.exec(
+            select(DailyReport).where(DailyReport.report_date == today_str)
+        ).all()
+        daily_by_agent = {d.agent_id: d for d in all_daily}
+
+        fieldnames = [
+            "agent_id", "hostname", "display_name", "date",
+            "work_seconds", "personal_seconds", "neutral_seconds",
+            "meeting_seconds", "meetings_count",
+            "active_seconds", "idle_seconds", "keystrokes_total",
+            "first_activity_at", "last_activity_at", "daily_score",
+        ]
+
+        rows = []
+        for a in agents:
+            by_cat = cats_by_agent.get(a.agent_id, {"work": 0, "personal": 0, "neutral": 0})
+
+            agent_meetings = meetings_by_agent.get(a.agent_id, [])
+            meeting_seconds = sum(
+                int((_as_utc(m.ended_at) - _as_utc(m.started_at)).total_seconds())
+                for m in agent_meetings if m.ended_at
+            )
+
+            idle_rows = idle_by_agent.get(a.agent_id, [])
+            total_interval = sum(r.interval_seconds for r in idle_rows)
+            idle_interval = sum(r.interval_seconds for r in idle_rows if r.idle_seconds > 60)
+            active_interval = total_interval - idle_interval
+            active_samples = [r for r in idle_rows if r.idle_seconds <= 60]
+            first_at = min((r.captured_at for r in active_samples), default=None)
+            last_at = max((r.captured_at for r in active_samples), default=None)
+
+            daily = daily_by_agent.get(a.agent_id)
+            daily_score = daily.productivity_score if daily and daily.status == "done" else None
+
+            rows.append({
+                "agent_id": a.agent_id,
+                "hostname": a.hostname,
+                "display_name": a.display_name or a.hostname,
+                "date": date_str,
+                "work_seconds": by_cat.get("work", 0),
+                "personal_seconds": by_cat.get("personal", 0),
+                "neutral_seconds": by_cat.get("neutral", 0),
+                "meeting_seconds": meeting_seconds,
+                "meetings_count": len(agent_meetings),
+                "active_seconds": active_interval,
+                "idle_seconds": idle_interval,
+                "keystrokes_total": ks_by_agent.get(a.agent_id, 0),
+                "first_activity_at": _as_utc(first_at).isoformat() if first_at else "",
+                "last_activity_at": _as_utc(last_at).isoformat() if last_at else "",
+                "daily_score": daily_score if daily_score is not None else "",
+            })
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+    buf.seek(0)
+
+    filename = f"team-{date_str}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ---------- Daily Report ----------

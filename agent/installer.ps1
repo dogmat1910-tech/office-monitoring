@@ -63,20 +63,49 @@ Get-Process -Name "office-monitoring-agent","office-monitoring-watchdog" -ErrorA
     Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
 
-# --- Скачиваем .exe ---
+# --- Скачиваем .exe с проверкой SHA256 ---
+# Сначала получаем хеши от сервера (тот же источник что и auto-update)
+Info "Получаю версию и SHA256..."
+try {
+    $versionInfo = Invoke-RestMethod -Uri "$ReleaseBase/agent/version" -UseBasicParsing -TimeoutSec 10
+    $sha256Agent = $versionInfo.sha256_agent
+    $sha256Watch = $versionInfo.sha256_watchdog
+    Ok "  Версия: $($versionInfo.version), SHA256 получены"
+} catch {
+    Warn "Не смог получить SHA256 от сервера — скачаю без проверки: $_"
+    $sha256Agent = $null
+    $sha256Watch = $null
+}
+
 Info "Скачиваю $AgentExe с $AgentUrl..."
 $agentPath = Join-Path $InstallDir $AgentExe
 Invoke-WebRequest -Uri $AgentUrl -OutFile $agentPath -UseBasicParsing
 Unblock-File -Path $agentPath
 $agentSize = [math]::Round((Get-Item $agentPath).Length / 1MB, 1)
-Ok "  $AgentExe ($agentSize MB)"
+if ($sha256Agent) {
+    $actualHash = (Get-FileHash -Path $agentPath -Algorithm SHA256).Hash.ToLower()
+    if ($actualHash -ne $sha256Agent) {
+        Fail "SHA256 mismatch для $AgentExe! Ожидали: $sha256Agent, получили: $actualHash. Файл повреждён или подменён."
+    }
+    Ok "  $AgentExe ($agentSize MB) SHA256 OK"
+} else {
+    Ok "  $AgentExe ($agentSize MB)"
+}
 
 Info "Скачиваю $WatchExe с $WatchUrl..."
 $watchPath = Join-Path $InstallDir $WatchExe
 Invoke-WebRequest -Uri $WatchUrl -OutFile $watchPath -UseBasicParsing
 Unblock-File -Path $watchPath
 $watchSize = [math]::Round((Get-Item $watchPath).Length / 1MB, 1)
-Ok "  $WatchExe ($watchSize MB)"
+if ($sha256Watch) {
+    $actualHash = (Get-FileHash -Path $watchPath -Algorithm SHA256).Hash.ToLower()
+    if ($actualHash -ne $sha256Watch) {
+        Fail "SHA256 mismatch для $WatchExe! Ожидали: $sha256Watch, получили: $actualHash."
+    }
+    Ok "  $WatchExe ($watchSize MB) SHA256 OK"
+} else {
+    Ok "  $WatchExe ($watchSize MB)"
+}
 
 # --- Wrapper-скрипты (для env vars + start без окна) ---
 $runAgentBat = Join-Path $InstallDir "run-agent.cmd"

@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 import httpx
 from sqlmodel import Session, select
 
+from llm_retry import with_llm_retry
+
 log = logging.getLogger("classify_keystroke_text")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -99,9 +101,10 @@ def classify_one(text: str, app_name: str, window_title: str) -> tuple[str, floa
         f"Верни JSON {{category, confidence, reason}}."
     )
 
-    try:
+    @with_llm_retry
+    def _call_llm():
         with httpx.Client(timeout=30.0) as client:
-            r = client.post(
+            resp = client.post(
                 OPENROUTER_URL,
                 headers={
                     "Authorization": f"Bearer {API_KEY}",
@@ -117,9 +120,12 @@ def classify_one(text: str, app_name: str, window_title: str) -> tuple[str, floa
                     "max_tokens": 200,
                 },
             )
-            r.raise_for_status()
-            content = r.json()["choices"][0]["message"]["content"]
-            data = json.loads(_clean_json(content))
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        content = _call_llm()
+        data = json.loads(_clean_json(content))
     except Exception as e:
         log.warning("classify_one failed: %s", e)
         return None

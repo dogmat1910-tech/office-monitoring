@@ -25,6 +25,8 @@ from pathlib import Path
 
 import httpx
 
+from llm_retry import with_llm_retry
+
 log = logging.getLogger("worker")
 
 TRANSCRIBE_BACKEND = os.environ.get("OM_TRANSCRIBE_BACKEND", "gemini")  # gemini | whisper
@@ -72,39 +74,42 @@ def _transcribe_gemini(audio_bytes: bytes, audio_format: str) -> dict:
         raise RuntimeError("OM_OPENROUTER_API_KEY не задан")
 
     audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+    @with_llm_retry
+    def _call_llm():
+        with httpx.Client(timeout=120.0) as client:
+            resp = client.post(
+                OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://office.lkdzrkk.pro",
+                    "X-Title": "Office Monitoring - Transcription",
+                },
+                json={
+                    "model": GEMINI_MODEL,
+                    "messages": [
+                        {"role": "system", "content": GEMINI_SYSTEM},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": GEMINI_PROMPT},
+                                {
+                                    "type": "input_audio",
+                                    "input_audio": {"data": audio_b64, "format": audio_format},
+                                },
+                            ],
+                        },
+                    ],
+                    "temperature": 0.0,
+                    "max_tokens": 4096,
+                },
+            )
+            resp.raise_for_status()
+            return (resp.json()["choices"][0]["message"]["content"] or "").strip()
+
     t0 = time.monotonic()
-
-    with httpx.Client(timeout=120.0) as client:
-        r = client.post(
-            OPENROUTER_URL,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://office.lkdzrkk.pro",
-                "X-Title": "Office Monitoring - Transcription",
-            },
-            json={
-                "model": GEMINI_MODEL,
-                "messages": [
-                    {"role": "system", "content": GEMINI_SYSTEM},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": GEMINI_PROMPT},
-                            {
-                                "type": "input_audio",
-                                "input_audio": {"data": audio_b64, "format": audio_format},
-                            },
-                        ],
-                    },
-                ],
-                "temperature": 0.0,
-                "max_tokens": 4096,
-            },
-        )
-        r.raise_for_status()
-        text = (r.json()["choices"][0]["message"]["content"] or "").strip()
-
+    text = _call_llm()
     elapsed = time.monotonic() - t0
 
     if _looks_like_hallucination(text):

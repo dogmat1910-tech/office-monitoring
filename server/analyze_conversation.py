@@ -19,6 +19,7 @@ import httpx
 from sqlmodel import Session, select
 
 from analyze import _extract_json
+from llm_retry import with_llm_retry
 from main import Conversation, Meeting, WindowSample, engine, _as_utc
 
 log = logging.getLogger("worker")
@@ -131,29 +132,33 @@ def analyze_conversation(conversation_id: int) -> dict:
     user_prompt = build_user_prompt(conv)
     log.info("conversation %d: LLM-анализ (длительность %.1fs)", conversation_id, conv.duration_seconds)
 
+    @with_llm_retry
+    def _call_llm():
+        resp = httpx.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "HTTP-Referer": "https://office.lkdzrkk.pro",
+                "X-Title": "office-monitoring-conversation",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MODEL,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 1500,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=90.0,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
     t0 = time.monotonic()
-    r = httpx.post(
-        OPENROUTER_URL,
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "HTTP-Referer": "https://office.lkdzrkk.pro",
-            "X-Title": "office-monitoring-conversation",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": MODEL,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.2,
-            "max_tokens": 1500,
-            "response_format": {"type": "json_object"},
-        },
-        timeout=90.0,
-    )
-    r.raise_for_status()
-    content = r.json()["choices"][0]["message"]["content"]
+    content = _call_llm()
     parsed = _extract_json(content)
     elapsed = time.monotonic() - t0
 
