@@ -384,6 +384,44 @@
     .kind.phone_work { background: #4ade80; color: #052e16; }
     .kind.phone_personal { background: #f87171; color: #450a0a; }
     .kind.other_speech { background: #94a3b8; color: #0f172a; }
+
+    /* Pagination */
+    .pagination {
+      display: flex; align-items: center; justify-content: center; gap: 12px;
+      padding: 12px 0; margin-top: 8px;
+    }
+    .pagination button {
+      background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+      border-radius: 6px; padding: 6px 14px; font-size: 13px; cursor: pointer;
+    }
+    .pagination button:hover:not(:disabled) { border-color: var(--accent); }
+    .pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .pagination .page-info { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+
+    /* Mobile responsive */
+    @media (max-width: 768px) {
+      main { grid-template-columns: 1fr; }
+      aside { display: none; }
+      .tabs { overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
+      .tab { flex-shrink: 0; }
+      .day-summary { grid-template-columns: repeat(2, 1fr); }
+      .day-tile { min-width: 120px; }
+      .team-row { grid-template-columns: 1fr; gap: 6px; }
+      .team-row.header { display: none; }
+      .team-stack { margin-top: 4px; }
+      .team-stack-labels { flex-wrap: wrap; gap: 4px; }
+      .bar-row { grid-template-columns: 1fr auto; }
+      .bar-row .bar-bg { display: none; }
+      .panel { margin: 0 10px 12px; padding: 12px; }
+      header { flex-wrap: wrap; gap: 8px; padding: 10px 12px; }
+      .controls { flex-wrap: wrap; gap: 6px; }
+      .voice-seg { grid-template-columns: 1fr; gap: 4px; }
+      .twocol { grid-template-columns: 1fr; }
+      .daily-grid { grid-template-columns: 1fr; }
+      .daily-header { grid-template-columns: 1fr auto; }
+      .scr-grid { grid-template-columns: 1fr; }
+      .check-item { grid-template-columns: 20px 1fr; }
+    }
   </style>
 </head>
 <body>
@@ -635,6 +673,23 @@
     let teamPollTimer = null;
     let dailyPollTimer = null;
 
+    // Pagination state
+    let voicePage = 0, windowsPage = 0, conversationsPage = 0, screenshotsPage = 0;
+    const VOICE_PAGE_SIZE = 20;
+    const WINDOWS_PAGE_SIZE = 20;
+    const CONVERSATIONS_PAGE_SIZE = 10;
+    const SCREENSHOTS_PAGE_SIZE = 20;
+
+    function renderPagination(page, totalItems, pageSize, onPageChange) {
+      const totalPages = Math.ceil(totalItems / pageSize);
+      if (totalPages <= 1) return '';
+      return `<div class="pagination">
+        <button ${page <= 0 ? 'disabled' : ''} onclick="(${onPageChange})(${page - 1})">&larr; Назад</button>
+        <span class="page-info">страница ${page + 1} из ${totalPages}</span>
+        <button ${page >= totalPages - 1 ? 'disabled' : ''} onclick="(${onPageChange})(${page + 1})">Далее &rarr;</button>
+      </div>`;
+    }
+
     // ───────────── Tabs ─────────────
     function applyTab(name) {
       activeTab = name;
@@ -743,6 +798,8 @@
 
     async function loadAgentData() {
       if (!selectedAgent) return;
+      // Reset pagination on data reload
+      voicePage = 0; windowsPage = 0; conversationsPage = 0; screenshotsPage = 0;
       const rq = rangeQuery();
       const [daySummaryR, windowsR, meetingsR, voiceR, activityR, convListR, convSumR, scrR] = await Promise.all([
         fetch(`/agents/${selectedAgent}/day_summary?${rq}`),
@@ -784,8 +841,11 @@
       applyScreenshotFilters();
     }
 
+    let lastFilteredScreenshots = [];
+    window._setScreenshotsPage = function(p) { screenshotsPage = p; renderScreenshotsPage(); };
+
     function applyScreenshotFilters() {
-      const el = $("#screenshotsGrid");
+      screenshotsPage = 0; // reset page on filter change
       const catFilter = ($("#scrFilterCategory") || {}).value || "";
       const ocrQuery = ($("#scrFilterOcr") || {}).value || "";
       const ocrLower = ocrQuery.toLowerCase().trim();
@@ -807,6 +867,14 @@
         }
       }
 
+      lastFilteredScreenshots = filtered;
+      renderScreenshotsPage();
+    }
+
+    function renderScreenshotsPage() {
+      const el = $("#screenshotsGrid");
+      const filtered = lastFilteredScreenshots;
+
       if (!filtered.length) {
         const msg = allScreenshots.length
           ? "нет скриншотов, подходящих под фильтр"
@@ -814,7 +882,8 @@
         el.innerHTML = `<div class="empty">${msg}</div>`;
         return;
       }
-      el.innerHTML = `<div class="scr-grid">${filtered.map(s => {
+      const paged = filtered.slice(screenshotsPage * SCREENSHOTS_PAGE_SIZE, (screenshotsPage + 1) * SCREENSHOTS_PAGE_SIZE);
+      el.innerHTML = `<div class="scr-grid">${paged.map(s => {
         const cat = s.category || 'neutral';
         const ocr = s.ocr_text ? s.ocr_text.slice(0, 200) : (s.ocr_done ? "(текст не распознан)" : "⏳ OCR в очереди");
         return `<div class="scr-card">
@@ -829,7 +898,7 @@
             ${ocr ? `<div class="ocr">${escapeHTML(ocr)}</div>` : ''}
           </div>
         </div>`;
-      }).join("")}</div>`;
+      }).join("")}</div>` + renderPagination(screenshotsPage, filtered.length, SCREENSHOTS_PAGE_SIZE, 'window._setScreenshotsPage');
     }
 
     window.openScreenshot = function(id) {
@@ -837,7 +906,17 @@
       $("#scrModal").classList.add("open");
     };
 
+    let allConversations = [];
+    let lastConvSummary = {};
     function renderConversations(convs, summary) {
+      allConversations = convs;
+      lastConvSummary = summary;
+      renderConversationsPage();
+    }
+    window._setConversationsPage = function(p) { conversationsPage = p; renderConversationsPage(); };
+    function renderConversationsPage() {
+      const convs = allConversations;
+      const summary = lastConvSummary;
       // плитки сводки
       const sumEl = $("#conversationsSummary");
       const meetings_diff = (summary.meetings_by_recording || 0) - (summary.meetings_by_button || 0);
@@ -854,11 +933,12 @@
         el.innerHTML = '<div class="empty">разговоров за этот период нет</div>';
         return;
       }
+      const paged = convs.slice(conversationsPage * CONVERSATIONS_PAGE_SIZE, (conversationsPage + 1) * CONVERSATIONS_PAGE_SIZE);
       el.innerHTML = `<table>
         <thead><tr>
           <th>Время</th><th>Длит.</th><th>Тип</th><th>Краткое содержание</th><th>Кнопка</th>
         </tr></thead>
-        <tbody>${convs.map(c => {
+        <tbody>${paged.map(c => {
           const kindBadge = c.kind ? `<span class="kind ${c.kind}">${kindLabel(c.kind)}</span>` : '<span class="muted">⏳ анализ...</span>';
           const sync = c.sync_status === 'matched' ? '<span class="badge meeting">✓ совпала</span>'
                      : (c.kind === 'meeting' && !c.related_meeting_id) ? '<span class="badge meeting" style="background:#b91c1c">⚠ без кнопки</span>'
@@ -872,7 +952,7 @@
             <td>${sync}</td>
           </tr>`;
         }).join("")}</tbody>
-      </table>`;
+      </table>` + renderPagination(conversationsPage, convs.length, CONVERSATIONS_PAGE_SIZE, 'window._setConversationsPage');
     }
 
     function renderActivityTiles(a) {
@@ -882,13 +962,17 @@
         const d = new Date(iso);
         return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
       };
+      const fakeAlert = a.fake_activity_suspect
+        ? `<div class="day-tile" style="border-left-color: #f87171; background: rgba(248,113,113,0.1);"><div class="label" style="color: #f87171;">⚠️ подозрение</div><div class="value" style="color: #f87171; font-size: 12px;">jiggler?</div><div style="font-size: 10px; color: #f87171; opacity: 0.8;">активен ${fmtSec(a.active_seconds||0)}, ${a.keystrokes_total||0} кл., ${a.voice_segments_count||0} голос.</div></div>`
+        : "";
       $("#activityTiles").innerHTML = `
         <div class="day-tile work"><div class="label">начало работы</div><div class="value">${fmtHM(a.first_activity_at)}</div></div>
         <div class="day-tile work"><div class="label">конец работы</div><div class="value">${fmtHM(a.last_activity_at)}</div></div>
         <div class="day-tile work"><div class="label">за компом</div><div class="value">${fmtSec(a.active_seconds || 0)}</div></div>
         <div class="day-tile personal"><div class="label">бездействие</div><div class="value">${fmtSec(a.idle_seconds || 0)}</div></div>
         <div class="day-tile neutral"><div class="label">всего символов</div><div class="value">${a.keystrokes_total || 0}</div></div>
-        <div class="day-tile meeting"><div class="label">приложений с вводом</div><div class="value">${(a.keystrokes_by_app || []).length}</div></div>`;
+        <div class="day-tile meeting"><div class="label">приложений с вводом</div><div class="value">${(a.keystrokes_by_app || []).length}</div></div>
+        ${fakeAlert}`;
     }
 
     function renderKeystrokes(a) {
@@ -1088,7 +1172,14 @@
     }
 
     // ───────────── Tab: Голос ─────────────
+    let allVoiceSegs = [];
     function renderVoice(segs) {
+      allVoiceSegs = segs;
+      renderVoicePage();
+    }
+    window._setVoicePage = function(p) { voicePage = p; renderVoicePage(); };
+    function renderVoicePage() {
+      const segs = allVoiceSegs;
       const el = $("#voiceList");
       if (!segs.length) {
         el.innerHTML = '<div class="empty">голосовых сегментов нет (always-on не запущен или менеджер молчит)</div>';
@@ -1099,7 +1190,8 @@
       const head = `<div class="muted" style="margin-bottom: 8px; font-size: 12px;">
         ${segs.length} сегмент(ов) · суммарно ${fmtSec(Math.round(total))} · транскрибировано ${transcribed}/${segs.length}
       </div>`;
-      el.innerHTML = head + segs.map(s => {
+      const paged = segs.slice(voicePage * VOICE_PAGE_SIZE, (voicePage + 1) * VOICE_PAGE_SIZE);
+      el.innerHTML = head + paged.map(s => {
         const kindHtml = s.kind ? `<span class="kind ${s.kind}">${kindLabel(s.kind)}</span>` : '';
         const summaryHtml = s.kind_summary ? `<div class="muted" style="font-size:11px;margin-top:2px;">▸ ${escapeHTML(s.kind_summary)}</div>` : '';
         const text = s.transcribed
@@ -1110,7 +1202,7 @@
           <div class="dur">${fmtSec(Math.round(s.duration_seconds))}</div>
           ${text}
         </div>`;
-      }).join("");
+      }).join("") + renderPagination(voicePage, segs.length, VOICE_PAGE_SIZE, 'window._setVoicePage');
     }
     function kindLabel(k) {
       return ({
@@ -1124,22 +1216,30 @@
     }
 
     // ───────────── Tab: Окна ─────────────
+    let allWindows = [];
     function renderWindows(windows) {
+      allWindows = windows;
+      renderWindowsPage();
+    }
+    window._setWindowsPage = function(p) { windowsPage = p; renderWindowsPage(); };
+    function renderWindowsPage() {
+      const windows = allWindows;
       const el = $("#windowsTable");
       if (!windows.length) {
         el.innerHTML = '<div class="empty">нет данных</div>';
         return;
       }
+      const paged = windows.slice(windowsPage * WINDOWS_PAGE_SIZE, (windowsPage + 1) * WINDOWS_PAGE_SIZE);
       el.innerHTML = `<table>
         <thead><tr><th>Время</th><th>Приложение</th><th>Заголовок окна</th><th class="num">Длит.</th></tr></thead>
-        <tbody>${windows.map(w => `
+        <tbody>${paged.map(w => `
           <tr>
             <td class="muted">${fmtTime(w.captured_at)}</td>
             <td>${escapeHTML(w.app_name)}</td>
             <td class="muted">${escapeHTML(w.title || "—")}</td>
             <td class="num">${fmtSec(w.duration_seconds)}</td>
           </tr>`).join("")}</tbody>
-      </table>`;
+      </table>` + renderPagination(windowsPage, windows.length, WINDOWS_PAGE_SIZE, 'window._setWindowsPage');
     }
 
     // ───────────── Tab: Команда (overview всех агентов) ─────────────

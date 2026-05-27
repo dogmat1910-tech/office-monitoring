@@ -919,6 +919,23 @@ def agent_activity_summary(agent_id: str, hours: int = 24, date: str | None = No
         )
         ks_total = sum(x["keystrokes"] for x in ks_by_app)
 
+        # Голосовые сегменты за период — для детектора фейковой активности
+        voice_count = session.exec(
+            select(func.count(VoiceSegment.id))
+            .where(VoiceSegment.agent_id == agent_id)
+            .where(VoiceSegment.started_at >= since)
+            .where(VoiceSegment.started_at < until)
+        ).one()
+
+        # Детектор фейковой активности (jiggler/autoclicker):
+        # Менеджер "активен" > 2 часов, но нет ни нажатий клавиш, ни голоса.
+        # Вероятно: jiggler двигает мышь / autoclicker кликает.
+        fake_activity_suspect = (
+            active_interval > 7200  # > 2 часов "активности"
+            and ks_total < 50       # почти нет нажатий клавиш
+            and (voice_count or 0) == 0  # ни одного голосового сегмента
+        )
+
         return {
             "agent_id": agent_id,
             "hours": hours,
@@ -930,6 +947,8 @@ def agent_activity_summary(agent_id: str, hours: int = 24, date: str | None = No
             "last_activity_at": _as_utc(last_at).isoformat() if last_at else None,
             "keystrokes_total": ks_total,
             "keystrokes_by_app": ks_by_app[:20],
+            "voice_segments_count": voice_count or 0,
+            "fake_activity_suspect": fake_activity_suspect,
         }
 
 

@@ -89,6 +89,71 @@ def _clean_json(text: str) -> str:
     return text.strip()
 
 
+def classify_batch_texts(items: list[dict]) -> dict[int, tuple[str, float, str]]:
+    """Классифицирует пакет текстов за один LLM-запрос.
+    items: [{id, text, app_name, window_title}, ...]
+    Возвращает {id: (category, confidence, reason)}."""
+    if not items or not API_KEY:
+        return {}
+
+    entries = "\n".join(
+        f"[{i['id']}] app={i['app_name']}, окно={i.get('window_title', '?')}: «{i['text'][:200]}»"
+        for i in items
+    )
+    user_prompt = (
+        f"Классифицируй каждое сообщение менеджера ниже. "
+        f"Верни JSON-массив: [{{\"id\": N, \"category\": \"work|personal|unclear\", "
+        f"\"confidence\": 0.0-1.0, \"reason\": \"макс 60 символов\"}}]\n\n{entries}"
+    )
+
+    @with_llm_retry
+    def _call_llm():
+        with httpx.Client(timeout=60.0) as client:
+            resp = client.post(
+                OPENROUTER_URL,
+                headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": MODEL,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 2000,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+
+    try:
+        content = _call_llm()
+        data = json.loads(_clean_json(content))
+        if not isinstance(data, list):
+            data = [data]
+    except Exception as e:
+        log.warning("classify_batch_texts failed: %s", e)
+        return {}
+
+    result: dict[int, tuple[str, float, str]] = {}
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            eid = int(entry.get("id", -1))
+        except (TypeError, ValueError):
+            continue
+        cat = entry.get("category")
+        if cat not in {"work", "personal", "unclear"}:
+            continue
+        try:
+            conf = float(entry.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            conf = 0.5
+        reason = (entry.get("reason") or "").strip()[:160]
+        result[eid] = (cat, max(0.0, min(1.0, conf)), reason)
+    return result
+
+
 def classify_one(text: str, app_name: str, window_title: str) -> tuple[str, float, str] | None:
     """Классифицирует один текст. Возвращает (category, confidence, reason) или None при ошибке."""
     if not API_KEY:
@@ -143,8 +208,7 @@ def classify_one(text: str, app_name: str, window_title: str) -> tuple[str, floa
 
 
 def process_batch(engine) -> int:
-    """Один тик: берёт до BATCH_SIZE необработанных сессий, классифицирует, сохраняет.
-    Возвращает число обработанных."""
+    """Один тик: берёт до BATCH_SIZE необработанных сессий, классифицирует батчем, сохраняет."""
     from main import KeystrokeText  # отложенный импорт
 
     processed = 0
@@ -159,27 +223,40 @@ def process_batch(engine) -> int:
         if not rows:
             return 0
 
+        # Разделяем: совсем короткие → unclear сразу, остальные → в батч
+        to_llm: list[dict] = []
         for row in rows:
             text = (row.text or "").strip()
-            # Слишком короткое — сразу unclear без обращения в LLM
             if len(text) < MIN_TEXT_CHARS:
                 row.llm_category = "unclear"
                 row.llm_confidence = 0.0
                 row.llm_reason = "слишком короткое для классификации"
                 session.add(row)
                 processed += 1
-                continue
+            else:
+                to_llm.append({
+                    "id": row.id,
+                    "text": text,
+                    "app_name": row.app_name,
+                    "window_title": row.window_title or "",
+                })
 
-            result = classify_one(text, row.app_name, row.window_title or "")
-            if result is None:
-                # LLM не ответил — не помечаем, попробуем в след. тик
-                continue
-            cat, conf, reason = result
-            row.llm_category = cat
-            row.llm_confidence = conf
-            row.llm_reason = reason
-            session.add(row)
-            processed += 1
+        # Один LLM-запрос на весь батч (вместо по одному)
+        if to_llm:
+            results = classify_batch_texts(to_llm)
+            rows_by_id = {r.id: r for r in rows}
+            for item in to_llm:
+                result = results.get(item["id"])
+                if result is None:
+                    continue
+                cat, conf, reason = result
+                row = rows_by_id.get(item["id"])
+                if row:
+                    row.llm_category = cat
+                    row.llm_confidence = conf
+                    row.llm_reason = reason
+                    session.add(row)
+                    processed += 1
 
         session.commit()
     return processed
