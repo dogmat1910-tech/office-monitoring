@@ -27,7 +27,7 @@ from conversations import cluster_pending_segments, get_active_agents_with_pendi
 from daily_report import generate_daily_report
 from diarization import diarize_conversation
 from ocr import ocr_image
-from transcribe import get_model, transcribe_meeting, transcribe_voice_segment
+from transcribe import transcribe_meeting, transcribe_voice_segment
 
 logging.basicConfig(
     level=logging.INFO,
@@ -484,10 +484,9 @@ def process_one() -> bool:
 
 
 def main() -> None:
-    log.info("worker starting, poll_interval=%d s", POLL_INTERVAL)
-    # прогреваем модель один раз — иначе первая транскрипция будет долго
-    get_model()
-    log.info("worker готов, ждём встречи")
+    log.info("worker starting, poll_interval=%d s, transcribe_backend=%s",
+             POLL_INTERVAL, os.environ.get("OM_TRANSCRIBE_BACKEND", "whisper"))
+    log.info("worker готов, ждём данные")
 
     while True:
         try:
