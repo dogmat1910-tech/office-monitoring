@@ -1232,6 +1232,67 @@ def set_app_category(payload: CategoryIn) -> dict:
     return {"status": "ok", "kind": payload.kind, "name": payload.name, "category": payload.category}
 
 
+@app.get("/agents/{agent_id}/keystroke_texts")
+def get_keystroke_texts(agent_id: str, hours: int = 24, date: str | None = None, limit: int = 100) -> dict:
+    """Возвращает классифицированные тексты переписки.
+    Текст НЕ включается по умолчанию (show_text=false в UI) —
+    админ должен явно нажать 🔓 чтобы раскрыть конкретную сессию."""
+    since, until = _time_range(date, hours)
+    with Session(engine) as session:
+        rows = session.exec(
+            select(KeystrokeText)
+            .where(KeystrokeText.agent_id == agent_id)
+            .where(KeystrokeText.started_at >= since)
+            .where(KeystrokeText.started_at < until)
+            .order_by(KeystrokeText.started_at.desc())
+            .limit(limit)
+        ).all()
+        # Статистика
+        total = len(rows)
+        by_cat = {"work": 0, "personal": 0, "unclear": 0, "unclassified": 0}
+        chars_by_cat = {"work": 0, "personal": 0, "unclear": 0, "unclassified": 0}
+        for r in rows:
+            cat = r.llm_category or "unclassified"
+            by_cat[cat] = by_cat.get(cat, 0) + 1
+            chars_by_cat[cat] = chars_by_cat.get(cat, 0) + r.char_count
+        items = [
+            {
+                "id": r.id,
+                "app_name": r.app_name,
+                "window_title": r.window_title,
+                "started_at": _as_utc(r.started_at).isoformat(),
+                "ended_at": _as_utc(r.ended_at).isoformat(),
+                "char_count": r.char_count,
+                "llm_category": r.llm_category,
+                "llm_confidence": r.llm_confidence,
+                "llm_reason": r.llm_reason,
+                # текст НЕ включаем — только по отдельному запросу с логированием
+            }
+            for r in rows
+        ]
+        return {
+            "total": total,
+            "by_category": by_cat,
+            "chars_by_category": chars_by_cat,
+            "items": items,
+        }
+
+
+@app.get("/admin/keystroke_text/{text_id}/reveal")
+def reveal_keystroke_text(text_id: int) -> dict:
+    """Раскрывает сырой текст одной сессии. Каждый вызов логируется."""
+    with Session(engine) as session:
+        row = session.get(KeystrokeText, text_id)
+        if not row:
+            raise HTTPException(404, "text not found")
+        logging.getLogger("audit").warning(
+            "REVEAL keystroke_text id=%d agent_id=%s app=%s time=%s",
+            text_id, row.agent_id, row.app_name,
+            _as_utc(row.started_at).isoformat(),
+        )
+        return {"id": row.id, "text": row.text}
+
+
 @app.post("/admin/classify_keystroke_text")
 def admin_classify_keystroke_text() -> dict:
     """Принудительно гоняет классификатор сейчас (не дожидаясь воркера)."""
