@@ -313,6 +313,50 @@
     .daily-recommendations { background: var(--panel); border-radius: 8px; padding: 14px 16px; }
     .daily-recommendations h3 { margin: 0 0 6px; text-transform: none; letter-spacing: 0; color: var(--accent); font-size: 14px; }
 
+    /* Report mode toggle */
+    .report-mode-toggle {
+      display: flex; background: var(--panel-2); border-radius: 6px; overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    .report-mode-btn {
+      background: transparent; color: var(--muted); border: none; padding: 6px 16px;
+      font-size: 13px; cursor: pointer; font-weight: 500; transition: all 0.15s;
+    }
+    .report-mode-btn:hover { color: var(--text); }
+    .report-mode-btn.active { background: var(--accent); color: #0f172a; font-weight: 600; }
+
+    /* Weekly Report */
+    .weekly-report { display: grid; gap: 16px; }
+    .weekly-header { display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: start; }
+    .weekly-summary { background: #1e3a5f; border-radius: 8px; padding: 14px 16px; line-height: 1.6; }
+    .weekly-trend {
+      display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+      border-radius: 8px; font-size: 14px; font-weight: 500;
+    }
+    .weekly-trend.improving { background: #14532d; color: #bbf7d0; }
+    .weekly-trend.stable { background: #1e3a5f; color: #93c5fd; }
+    .weekly-trend.declining { background: #7f1d1d; color: #fecaca; }
+    .weekly-trend .trend-icon { font-size: 20px; }
+    .weekly-breakdown { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+    .weekly-day-card {
+      background: var(--panel-2); border-radius: 8px; padding: 12px;
+      border-top: 3px solid var(--border); text-align: center;
+    }
+    .weekly-day-card .day-date { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    .weekly-day-card .day-score { font-size: 24px; font-weight: 700; }
+    .weekly-day-card .day-highlight { font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.3; }
+    .weekly-day-card.low { border-top-color: #b91c1c; }
+    .weekly-day-card.mid { border-top-color: #d97706; }
+    .weekly-day-card.high { border-top-color: #16a34a; }
+    .weekly-lists { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .weekly-list-section {
+      background: var(--panel-2); border-radius: 8px; padding: 14px;
+    }
+    .weekly-list-section h3 { margin: 0 0 8px; text-transform: none; letter-spacing: 0; color: var(--text); font-size: 14px; }
+    .weekly-list-section.strengths { border-top: 3px solid #4ade80; }
+    .weekly-list-section.concerns { border-top: 3px solid #f87171; }
+    .weekly-list-section ul { margin: 0; padding-left: 18px; font-size: 13px; line-height: 1.5; }
+
     /* Screenshots */
     .scr-grid {
       display: grid;
@@ -568,11 +612,18 @@
         </div>
       </div>
 
-      <!-- Tab: Daily Report -->
+      <!-- Tab: Daily Report / Weekly Report -->
       <div class="tab-content" data-tab-content="daily" hidden>
         <div class="panel">
-          <h2>Daily Report</h2>
-          <div class="daily-controls">
+          <div style="display: flex; align-items: center; gap: 16px; margin-bottom: 12px;">
+            <h2 style="margin: 0;">Report</h2>
+            <div class="report-mode-toggle">
+              <button class="report-mode-btn active" data-mode="daily">День</button>
+              <button class="report-mode-btn" data-mode="weekly">Неделя</button>
+            </div>
+          </div>
+          <!-- Daily controls -->
+          <div id="dailyControls" class="daily-controls">
             <label class="muted">Дата:
               <input type="date" id="dailyDate">
             </label>
@@ -580,6 +631,15 @@
             <button id="dailyRegenerate" class="btn-secondary" hidden>Перегенерировать</button>
           </div>
           <div id="dailyContent"></div>
+          <!-- Weekly controls -->
+          <div id="weeklyControls" class="daily-controls" hidden>
+            <label class="muted">Неделя с пн:
+              <input type="date" id="weeklyDate">
+            </label>
+            <button id="weeklyGenerate" class="btn-primary">Сгенерировать</button>
+            <button id="weeklyRegenerate" class="btn-secondary" hidden>Перегенерировать</button>
+          </div>
+          <div id="weeklyContent" hidden></div>
         </div>
       </div>
 
@@ -700,15 +760,22 @@
       if (name === "team") {
         loadTeam();
       } else if (name === "daily" && selectedAgent) {
-        pollDailyReport(selectedAgent, $("#dailyDate").value);
+        if (reportMode === "weekly") {
+          pollWeeklyReport(selectedAgent, $("#weeklyDate").value);
+        } else {
+          pollDailyReport(selectedAgent, $("#dailyDate").value);
+        }
       } else if (name === "keystroke-text") {
         loadKeystrokeTexts();
         clearDailyPoll();
+        if (typeof clearWeeklyPoll === "function") clearWeeklyPoll();
       } else if (name === "audit") {
         loadAudit();
         clearDailyPoll();
+        if (typeof clearWeeklyPoll === "function") clearWeeklyPoll();
       } else {
         clearDailyPoll();
+        if (typeof clearWeeklyPoll === "function") clearWeeklyPoll();
       }
     }
     $$(".tab").forEach(b => b.addEventListener("click", () => applyTab(b.dataset.tab)));
@@ -1885,6 +1952,186 @@
     $("#dailyRegenerate").addEventListener("click", () => generateDailyReport(true));
     $("#dailyDate").addEventListener("change", () => {
       if (selectedAgent) pollDailyReport(selectedAgent, $("#dailyDate").value);
+    });
+
+    // ───────────── Report mode toggle (Day / Week) ─────────────
+    let reportMode = "daily";
+    let weeklyPollTimer = null;
+
+    function getMonday(dateStr) {
+      const d = dateStr ? new Date(dateStr + "T00:00:00") : new Date();
+      const day = d.getDay();
+      const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+      d.setDate(diff);
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const dd = String(d.getDate()).padStart(2, "0");
+      return `${y}-${m}-${dd}`;
+    }
+
+    function applyReportMode(mode) {
+      reportMode = mode;
+      $$(".report-mode-btn").forEach(b => b.classList.toggle("active", b.dataset.mode === mode));
+      if (mode === "daily") {
+        $("#dailyControls").hidden = false;
+        $("#dailyContent").hidden = false;
+        $("#weeklyControls").hidden = true;
+        $("#weeklyContent").hidden = true;
+        clearWeeklyPoll();
+        if (selectedAgent) pollDailyReport(selectedAgent, $("#dailyDate").value);
+      } else {
+        $("#dailyControls").hidden = true;
+        $("#dailyContent").hidden = true;
+        $("#weeklyControls").hidden = false;
+        $("#weeklyContent").hidden = false;
+        clearDailyPoll();
+        if (selectedAgent) pollWeeklyReport(selectedAgent, $("#weeklyDate").value);
+      }
+    }
+
+    $$(".report-mode-btn").forEach(b => b.addEventListener("click", () => applyReportMode(b.dataset.mode)));
+
+    function clearWeeklyPoll() {
+      if (weeklyPollTimer) { clearInterval(weeklyPollTimer); weeklyPollTimer = null; }
+    }
+
+    function renderWeeklyEmpty(msg) {
+      $("#weeklyRegenerate").hidden = true;
+      $("#weeklyContent").innerHTML = `<div class="empty">${msg}</div>`;
+    }
+
+    function renderWeeklyPending() {
+      $("#weeklyRegenerate").hidden = true;
+      $("#weeklyContent").innerHTML = '<div class="empty">&#9203; LLM генерирует недельный отчёт... обычно 15-45 секунд</div>';
+    }
+
+    function renderWeeklyError(msg) {
+      $("#weeklyRegenerate").hidden = false;
+      $("#weeklyContent").innerHTML = `<div class="empty">&#10060; ошибка: ${escapeHTML(msg || "неизвестная")}</div>`;
+    }
+
+    function weeklyScoreClass(s) {
+      if (s == null) return "low";
+      if (s <= 4) return "low";
+      if (s <= 7) return "mid";
+      return "high";
+    }
+
+    function trendIcon(trend) {
+      if (trend === "improving") return { icon: "↗️", label: "Улучшение", cls: "improving" };
+      if (trend === "declining") return { icon: "↘️", label: "Ухудшение", cls: "declining" };
+      return { icon: "→", label: "Стабильно", cls: "stable" };
+    }
+
+    function renderWeeklyReport(d) {
+      $("#weeklyRegenerate").hidden = false;
+      const p = d.payload || {};
+      const score = d.productivity_score ?? p.productivity_score;
+      const trend = trendIcon(p.trend);
+      const breakdown = p.daily_breakdown || [];
+
+      const breakdown_html = breakdown.map(day => {
+        const cls = weeklyScoreClass(day.score);
+        return `<div class="weekly-day-card ${cls}">
+          <div class="day-date">${day.date || "?"}</div>
+          <div class="day-score">${day.score != null ? day.score : "?"}</div>
+          <div class="day-highlight">${escapeHTML(day.highlight || "")}</div>
+        </div>`;
+      }).join("");
+
+      const strengths_html = (p.strengths || []).length ? `
+        <div class="weekly-list-section strengths">
+          <h3>&#10004; Сильные стороны</h3>
+          <ul>${p.strengths.map(x => `<li>${escapeHTML(x)}</li>`).join("")}</ul>
+        </div>` : "";
+
+      const concerns_html = (p.concerns || []).length ? `
+        <div class="weekly-list-section concerns">
+          <h3>&#9888; Зоны внимания</h3>
+          <ul>${p.concerns.map(x => `<li>${escapeHTML(x)}</li>`).join("")}</ul>
+        </div>` : "";
+
+      const rec_html = p.recommendation ? `
+        <div class="daily-recommendations">
+          <h3>&#128161; Рекомендация руководителю</h3>
+          <div style="font-size: 13px; line-height: 1.5;">${escapeHTML(p.recommendation)}</div>
+        </div>` : "";
+
+      $("#weeklyContent").innerHTML = `
+        <div class="weekly-report">
+          <div class="weekly-header">
+            <div>
+              <div class="weekly-summary">${escapeHTML(p.summary || "(нет сводки)")}</div>
+              <div class="weekly-trend ${trend.cls}" style="margin-top: 10px;">
+                <span class="trend-icon">${trend.icon}</span>
+                <span><strong>${trend.label}</strong>${p.trend_details ? ": " + escapeHTML(p.trend_details) : ""}</span>
+              </div>
+            </div>
+            <div class="daily-score-big ${weeklyScoreClass(score)}">
+              <div class="num">${score != null ? (typeof score === "number" ? score.toFixed(1) : score) : "?"}</div>
+              <div class="lbl">из 10</div>
+            </div>
+          </div>
+          ${breakdown.length ? `<h3 style="margin: 4px 0 0;">По дням</h3><div class="weekly-breakdown">${breakdown_html}</div>` : ""}
+          <div class="weekly-lists">
+            ${strengths_html}
+            ${concerns_html}
+          </div>
+          ${rec_html}
+          <div class="daily-meta">модель: ${escapeHTML(d.model || "?")} · обработано за ${(d.processing_time_seconds || 0).toFixed(1)} с · готов ${d.completed_at ? fmtTime(d.completed_at) : "?"}</div>
+        </div>`;
+    }
+
+    async function pollWeeklyReport(agentId, weekStart) {
+      try {
+        const r = await fetch(`/agents/${agentId}/weekly_report?week_start=${weekStart}`);
+        const d = await r.json();
+        if (d.status === "done") {
+          renderWeeklyReport(d);
+          clearWeeklyPoll();
+        } else if (d.status === "error") {
+          renderWeeklyError(d.error_message);
+          clearWeeklyPoll();
+        } else if (d.status === "pending" || d.status === "processing") {
+          renderWeeklyPending();
+        } else {
+          renderWeeklyEmpty('Недельный отчёт за этот период ещё не сгенерирован. Нажми «Сгенерировать».');
+          clearWeeklyPoll();
+        }
+      } catch (e) {
+        renderWeeklyError(String(e));
+        clearWeeklyPoll();
+      }
+    }
+
+    function startWeeklyPoll(agentId, weekStart) {
+      clearWeeklyPoll();
+      pollWeeklyReport(agentId, weekStart);
+      weeklyPollTimer = setInterval(() => pollWeeklyReport(agentId, weekStart), 5000);
+    }
+
+    async function generateWeeklyReport(regenerate = false) {
+      if (!selectedAgent) { alert("выбери агента"); return; }
+      const weekStart = $("#weeklyDate").value;
+      if (!weekStart) { alert("выбери дату начала недели (понедельник)"); return; }
+      const endpoint = regenerate
+        ? `/agents/${selectedAgent}/weekly_report/regenerate?week_start=${weekStart}`
+        : `/agents/${selectedAgent}/weekly_report?week_start=${weekStart}`;
+      renderWeeklyPending();
+      try {
+        const r = await fetch(endpoint, { method: "POST" });
+        if (!r.ok) { renderWeeklyError(`HTTP ${r.status} ${await r.text()}`); return; }
+        startWeeklyPoll(selectedAgent, weekStart);
+      } catch (e) {
+        renderWeeklyError(String(e));
+      }
+    }
+
+    $("#weeklyDate").value = getMonday();
+    $("#weeklyGenerate").addEventListener("click", () => generateWeeklyReport(false));
+    $("#weeklyRegenerate").addEventListener("click", () => generateWeeklyReport(true));
+    $("#weeklyDate").addEventListener("change", () => {
+      if (selectedAgent) pollWeeklyReport(selectedAgent, $("#weeklyDate").value);
     });
 
     // ───────────── Init ─────────────

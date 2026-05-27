@@ -259,6 +259,21 @@ class DailyReport(SQLModel, table=True):
     error_message: str | None = None
 
 
+class WeeklyReport(SQLModel, table=True):
+    """LLM-сводка за рабочую неделю менеджера (пн-пт): тренды, агрегация, рекомендации."""
+    id: int | None = Field(default=None, primary_key=True)
+    agent_id: str = Field(index=True)
+    week_start: str = Field(index=True)  # YYYY-MM-DD понедельник
+    status: str = Field(index=True)  # pending | processing | done | error
+    productivity_score: float | None = None
+    payload_json: str | None = None  # JSON от LLM
+    model: str | None = None
+    processing_time_seconds: float | None = None
+    completed_at: datetime | None = None
+    created_at: datetime
+    error_message: str | None = None
+
+
 class VoiceSegment(SQLModel, table=True):
     """Сегмент непрерывной речи, найденный VAD-фильтром в always-on записи."""
     id: int | None = Field(default=None, primary_key=True)
@@ -2170,6 +2185,88 @@ def get_daily_report(agent_id: str, date: str) -> dict:
             "agent_id": rep.agent_id,
             "date": rep.report_date,
             "requested_at": _as_utc(rep.requested_at).isoformat(),
+            "completed_at": _as_utc(rep.completed_at).isoformat() if rep.completed_at else None,
+            "model": rep.model,
+            "productivity_score": rep.productivity_score,
+            "processing_time_seconds": rep.processing_time_seconds,
+            "error_message": rep.error_message,
+            "payload": payload,
+        }
+
+
+# ---------- Weekly Report ----------
+
+@app.post("/agents/{agent_id}/weekly_report")
+def request_weekly_report(agent_id: str, week_start: str) -> dict:
+    """Создаёт pending-запись недельного отчёта (или возвращает существующий). Воркер генерирует."""
+    try:
+        d = datetime.fromisoformat(week_start)
+    except ValueError:
+        raise HTTPException(400, "week_start должен быть YYYY-MM-DD")
+    # Проверяем что это понедельник
+    if d.weekday() != 0:
+        raise HTTPException(400, f"week_start должен быть понедельником, получен {d.strftime('%A')}")
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        existing = session.exec(
+            select(WeeklyReport).where(WeeklyReport.agent_id == agent_id, WeeklyReport.week_start == week_start)
+        ).first()
+        if existing:
+            if existing.status == "done":
+                return {"status": "done", "report_id": existing.id, "regenerated": False}
+            if existing.status in ("pending", "processing"):
+                return {"status": existing.status, "report_id": existing.id}
+            # error -> пересоздаём
+            session.delete(existing)
+            session.commit()
+        rep = WeeklyReport(
+            agent_id=agent_id,
+            week_start=week_start,
+            status="pending",
+            created_at=now,
+        )
+        session.add(rep)
+        session.commit()
+        session.refresh(rep)
+        return {"status": "pending", "report_id": rep.id}
+
+
+@app.post("/agents/{agent_id}/weekly_report/regenerate")
+def regenerate_weekly_report(agent_id: str, week_start: str) -> dict:
+    """Удаляет существующий недельный отчёт и просит новый."""
+    try:
+        datetime.fromisoformat(week_start)
+    except ValueError:
+        raise HTTPException(400, "week_start должен быть YYYY-MM-DD")
+    with Session(engine) as session:
+        existing = session.exec(
+            select(WeeklyReport).where(WeeklyReport.agent_id == agent_id, WeeklyReport.week_start == week_start)
+        ).first()
+        if existing:
+            session.delete(existing)
+            session.commit()
+    return request_weekly_report(agent_id, week_start)
+
+
+@app.get("/agents/{agent_id}/weekly_report")
+def get_weekly_report(agent_id: str, week_start: str) -> dict:
+    try:
+        datetime.fromisoformat(week_start)
+    except ValueError:
+        raise HTTPException(400, "week_start должен быть YYYY-MM-DD")
+    with Session(engine) as session:
+        rep = session.exec(
+            select(WeeklyReport).where(WeeklyReport.agent_id == agent_id, WeeklyReport.week_start == week_start)
+        ).first()
+        if rep is None:
+            return {"status": "absent", "agent_id": agent_id, "week_start": week_start}
+        payload = json.loads(rep.payload_json) if rep.payload_json else None
+        return {
+            "status": rep.status,
+            "report_id": rep.id,
+            "agent_id": rep.agent_id,
+            "week_start": rep.week_start,
+            "created_at": _as_utc(rep.created_at).isoformat(),
             "completed_at": _as_utc(rep.completed_at).isoformat() if rep.completed_at else None,
             "model": rep.model,
             "productivity_score": rep.productivity_score,

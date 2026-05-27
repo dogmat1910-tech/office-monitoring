@@ -19,12 +19,13 @@ from pathlib import Path
 from sqlmodel import Session, select
 
 # импорт моделей и engine из main.py
-from main import AUDIO_DIR, VOICE_DIR, SCREENSHOTS_DIR, Analysis, AudioChunk, DailyReport, Meeting, Screenshot, Transcript, VoiceSegment, engine
+from main import AUDIO_DIR, VOICE_DIR, SCREENSHOTS_DIR, Analysis, AudioChunk, DailyReport, Meeting, Screenshot, Transcript, VoiceSegment, WeeklyReport, engine
 from analyze import analyze_transcript
 from analyze_conversation import analyze_conversation
 from classify_voice import auto_bind_meeting_id, classify_voice_segment
 from conversations import cluster_pending_segments, get_active_agents_with_pending_segments
 from daily_report import generate_daily_report
+from weekly_report import generate_weekly_report
 # diarization через pyannote больше не нужен — Gemini 2.5 Flash сам
 # разделяет по ролям (Менеджер/Клиент) прямо в транскрипте.
 # from diarization import diarize_conversation
@@ -309,6 +310,54 @@ def process_daily_report(report_id: int) -> None:
             session.commit()
 
 
+def find_pending_weekly_report() -> int | None:
+    with Session(engine) as session:
+        rep = session.exec(
+            select(WeeklyReport).where(WeeklyReport.status == "pending").order_by(WeeklyReport.created_at)
+        ).first()
+        return rep.id if rep else None
+
+
+def process_weekly_report(report_id: int) -> None:
+    import json as _json
+    with Session(engine) as session:
+        rep = session.exec(select(WeeklyReport).where(WeeklyReport.id == report_id)).first()
+        if rep is None:
+            return
+        agent_id = rep.agent_id
+        week_start = rep.week_start
+        log.info("weekly_report %s/%s: старт генерации", agent_id, week_start)
+        rep.status = "processing"
+        session.add(rep)
+        session.commit()
+    try:
+        result = generate_weekly_report(agent_id, week_start)
+        meta = result.pop("_meta", {})
+        with Session(engine) as session:
+            rep = session.exec(select(WeeklyReport).where(WeeklyReport.id == report_id)).first()
+            if rep is None:
+                return
+            rep.status = "done"
+            rep.payload_json = _json.dumps(result, ensure_ascii=False)
+            rep.productivity_score = result.get("productivity_score")
+            rep.model = meta.get("model")
+            rep.processing_time_seconds = meta.get("processing_time_seconds")
+            rep.completed_at = datetime.now(timezone.utc)
+            session.add(rep)
+            session.commit()
+            log.info("weekly_report %s/%s: готов (score=%s)", agent_id, week_start, rep.productivity_score)
+    except Exception as e:
+        log.exception("weekly_report %s/%s: ошибка: %s", agent_id, week_start, e)
+        with Session(engine) as session:
+            rep = session.exec(select(WeeklyReport).where(WeeklyReport.id == report_id)).first()
+            if rep:
+                rep.status = "error"
+                rep.error_message = str(e)[:500]
+                rep.completed_at = datetime.now(timezone.utc)
+                session.add(rep)
+                session.commit()
+
+
 def process_voice_segment(segment_id: int) -> None:
     with Session(engine) as session:
         seg = session.exec(select(VoiceSegment).where(VoiceSegment.id == segment_id)).first()
@@ -460,6 +509,12 @@ def process_one() -> bool:
     pending_report = find_pending_daily_report() if _is_mode("analyze") else None
     if pending_report is not None:
         process_daily_report(pending_report)
+        return True
+
+    # Этап 3.5: weekly reports (scope: analyze)
+    pending_weekly = find_pending_weekly_report() if _is_mode("analyze") else None
+    if pending_weekly is not None:
+        process_weekly_report(pending_weekly)
         return True
 
     # Этап 4: LLM-анализ встреч (scope: analyze)
