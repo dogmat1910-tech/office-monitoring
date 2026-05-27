@@ -297,6 +297,35 @@ class VoiceSegment(SQLModel, table=True):
     speaker_label: str | None = None  # SPEAKER_00, SPEAKER_01, ... после diarization
 
 
+class PhoneCall(SQLModel, table=True):
+    """Звонок — из телефонии (UIS/Скорозвон) или обнаруженный always-on микрофоном."""
+    id: int | None = Field(default=None, primary_key=True)
+    agent_id: str = Field(index=True)
+    source: str  # "telephony" | "always_on" (микрофон ноутбука)
+    direction: str | None = None  # "inbound" | "outbound" | None (unknown для always_on)
+    started_at: datetime = Field(index=True)
+    ended_at: datetime | None = None
+    duration_seconds: float = 0
+    phone_number: str | None = None  # для телефонии, если известен
+    client_name: str | None = None
+    # Связь с Conversation (если always_on) или с внешней записью (если telephony)
+    conversation_id: int | None = Field(default=None, index=True)
+    external_id: str | None = Field(default=None, index=True)  # ID в UIS/Скорозвон
+    # Аудио
+    audio_file_path: str | None = None  # путь к MP3/WAV файлу записи
+    audio_type: str | None = None  # "full" | "one_sided"
+    # Транскрипт + анализ
+    transcript: str | None = None
+    transcribed_at: datetime | None = None
+    scenario: str | None = None  # "appointment" | "primary_sale" | "secondary_sale"
+    checklist_json: str | None = None  # JSON с результатами чеклиста
+    analysis_json: str | None = None  # полный JSON от LLM
+    final_score: float | None = None
+    analyzed_at: datetime | None = None
+    # Мета
+    created_at: datetime
+
+
 class Conversation(SQLModel, table=True):
     """Группа последовательных VoiceSegment'ов с паузами < CLUSTER_GAP_SECONDS.
     Один разговор = одно «событие» (встреча, звонок, болтовня, ...).
@@ -2505,6 +2534,177 @@ def conversations_summary(agent_id: str, hours: int = 24, date: str | None = Non
             "conversations_without_button": conversations_without_button,
             "sales_attempts": sales_attempts,
             "sales_closed": sales_closed,
+        }
+
+
+# ---------- Phone Calls ----------
+
+class TelephonyCallIn(BaseModel):
+    """Входящий звонок из телефонии (webhook от UIS/Скорозвон)."""
+    agent_id: str
+    external_id: str | None = None
+    direction: str | None = None  # inbound | outbound
+    phone_number: str | None = None
+    client_name: str | None = None
+    started_at: str | None = None  # ISO datetime
+    ended_at: str | None = None
+    duration_seconds: float | None = None
+    audio_url: str | None = None
+    scenario: str | None = None
+
+
+@app.get("/agents/{agent_id}/calls")
+def list_calls(agent_id: str, hours: int = 24, date: str | None = None, limit: int = 50) -> list[dict]:
+    """Список звонков агента за период."""
+    since, until = _time_range(date, hours, agent_id)
+    with Session(engine) as session:
+        rows = session.exec(
+            select(PhoneCall)
+            .where(PhoneCall.agent_id == agent_id)
+            .where(PhoneCall.started_at >= since)
+            .where(PhoneCall.started_at < until)
+            .order_by(PhoneCall.started_at.desc())
+            .limit(limit)
+        ).all()
+        return [
+            {
+                "call_id": c.id,
+                "agent_id": c.agent_id,
+                "source": c.source,
+                "direction": c.direction,
+                "started_at": _as_utc(c.started_at).isoformat(),
+                "ended_at": _as_utc(c.ended_at).isoformat() if c.ended_at else None,
+                "duration_seconds": c.duration_seconds,
+                "phone_number": c.phone_number,
+                "client_name": c.client_name,
+                "conversation_id": c.conversation_id,
+                "external_id": c.external_id,
+                "audio_type": c.audio_type,
+                "transcript": c.transcript,
+                "scenario": c.scenario,
+                "checklist": json.loads(c.checklist_json) if c.checklist_json else None,
+                "analysis": json.loads(c.analysis_json) if c.analysis_json else None,
+                "final_score": c.final_score,
+                "analyzed_at": _as_utc(c.analyzed_at).isoformat() if c.analyzed_at else None,
+                "created_at": _as_utc(c.created_at).isoformat(),
+            }
+            for c in rows
+        ]
+
+
+@app.post("/calls/from_telephony")
+def create_call_from_telephony(payload: TelephonyCallIn) -> dict:
+    """Приём звонка из телефонии (заглушка для webhook UIS/Скорозвон).
+
+    В будущем здесь будет: скачивание аудио по audio_url, транскрипция,
+    LLM-анализ. Пока только сохраняем мета-данные."""
+    now = datetime.now(timezone.utc)
+
+    # Идемпотентность по external_id
+    if payload.external_id:
+        with Session(engine) as session:
+            existing = session.exec(
+                select(PhoneCall).where(PhoneCall.external_id == payload.external_id)
+            ).first()
+            if existing:
+                return {"status": "already_exists", "call_id": existing.id}
+
+    started_at = now
+    ended_at = None
+    if payload.started_at:
+        try:
+            started_at = _as_utc(datetime.fromisoformat(payload.started_at))
+        except ValueError:
+            pass
+    if payload.ended_at:
+        try:
+            ended_at = _as_utc(datetime.fromisoformat(payload.ended_at))
+        except ValueError:
+            pass
+
+    duration = payload.duration_seconds or 0
+    if not duration and ended_at and started_at:
+        duration = (ended_at - started_at).total_seconds()
+
+    with Session(engine) as session:
+        call = PhoneCall(
+            agent_id=payload.agent_id,
+            source="telephony",
+            direction=payload.direction,
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_seconds=duration,
+            phone_number=payload.phone_number,
+            client_name=payload.client_name,
+            external_id=payload.external_id,
+            audio_type="full",  # телефония обычно даёт полную запись
+            scenario=payload.scenario,
+            created_at=now,
+        )
+        session.add(call)
+        session.commit()
+        session.refresh(call)
+        return {"status": "ok", "call_id": call.id}
+
+
+@app.get("/agents/{agent_id}/calls_summary")
+def calls_summary(agent_id: str, hours: int = 24, date: str | None = None) -> dict:
+    """Сводка по звонкам: всего, рабочих, личных, назначений, продаж, средний score."""
+    since, until = _time_range(date, hours, agent_id)
+    with Session(engine) as session:
+        calls = session.exec(
+            select(PhoneCall)
+            .where(PhoneCall.agent_id == agent_id)
+            .where(PhoneCall.started_at >= since)
+            .where(PhoneCall.started_at < until)
+        ).all()
+
+        total = len(calls)
+        total_duration = sum(c.duration_seconds for c in calls)
+        by_source = {"telephony": 0, "always_on": 0}
+        work_count = 0
+        personal_count = 0
+        appointments = 0
+        sales = 0
+        scores = []
+
+        for c in calls:
+            by_source[c.source] = by_source.get(c.source, 0) + 1
+            # Определяем рабочий/личный по связанному conversation
+            if c.conversation_id:
+                conv = session.exec(
+                    select(Conversation).where(Conversation.id == c.conversation_id)
+                ).first()
+                if conv:
+                    if conv.kind == "phone_work":
+                        work_count += 1
+                    elif conv.kind == "phone_personal":
+                        personal_count += 1
+            elif c.source == "telephony":
+                work_count += 1  # телефония = рабочий по умолчанию
+
+            if c.scenario == "appointment":
+                appointments += 1
+            elif c.scenario in ("primary_sale", "secondary_sale"):
+                sales += 1
+
+            if c.final_score is not None:
+                scores.append(c.final_score)
+
+        avg_score = round(sum(scores) / len(scores), 1) if scores else None
+
+        return {
+            "agent_id": agent_id,
+            "hours": hours,
+            "total": total,
+            "total_duration_seconds": total_duration,
+            "by_source": by_source,
+            "work_count": work_count,
+            "personal_count": personal_count,
+            "appointments": appointments,
+            "sales": sales,
+            "avg_score": avg_score,
+            "scored_count": len(scores),
         }
 
 

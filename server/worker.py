@@ -19,7 +19,7 @@ from pathlib import Path
 from sqlmodel import Session, select
 
 # импорт моделей и engine из main.py
-from main import AUDIO_DIR, VOICE_DIR, SCREENSHOTS_DIR, Analysis, AudioChunk, DailyReport, Meeting, Screenshot, Transcript, VoiceSegment, WeeklyReport, engine
+from main import AUDIO_DIR, VOICE_DIR, SCREENSHOTS_DIR, Analysis, AudioChunk, DailyReport, Meeting, PhoneCall, Screenshot, Transcript, VoiceSegment, WeeklyReport, engine
 from analyze import analyze_transcript
 from analyze_conversation import analyze_conversation
 from classify_voice import auto_bind_meeting_id, classify_voice_segment
@@ -442,6 +442,64 @@ def _is_mode(*allowed: str) -> bool:
     return WORKER_MODE == "all" or WORKER_MODE in allowed
 
 
+def auto_create_phone_calls() -> int:
+    """Ищет проанализированные Conversation с kind=phone_work/phone_personal,
+    для которых ещё нет PhoneCall, и создаёт PhoneCall(source='always_on').
+    Возвращает количество созданных записей."""
+    from main import Conversation, PhoneCall
+    import json as _json
+    created = 0
+    with Session(engine) as session:
+        # Все conversation_id, которые уже привязаны к PhoneCall
+        existing_conv_ids_q = select(PhoneCall.conversation_id).where(PhoneCall.conversation_id.is_not(None))
+        existing_conv_ids = {row for row in session.exec(existing_conv_ids_q).all()}
+
+        convs = session.exec(
+            select(Conversation)
+            .where(Conversation.kind.in_(["phone_work", "phone_personal"]))
+            .where(Conversation.analyzed_at.is_not(None))
+            .order_by(Conversation.started_at)
+        ).all()
+
+        for c in convs:
+            if c.id in existing_conv_ids:
+                continue
+
+            # Извлекаем данные анализа
+            payload = {}
+            if c.payload_json:
+                try:
+                    payload = _json.loads(c.payload_json)
+                except Exception:
+                    pass
+
+            call = PhoneCall(
+                agent_id=c.agent_id,
+                source="always_on",
+                direction=None,  # unknown для always_on
+                started_at=c.started_at,
+                ended_at=c.ended_at,
+                duration_seconds=c.duration_seconds or 0,
+                conversation_id=c.id,
+                audio_type="one_sided",
+                transcript=c.full_text,
+                transcribed_at=c.analyzed_at,
+                scenario=payload.get("scenario"),
+                checklist_json=_json.dumps(payload.get("checklist", []), ensure_ascii=False) if payload.get("checklist") else None,
+                analysis_json=c.payload_json,
+                final_score=c.sale_quality_score,
+                analyzed_at=c.analyzed_at,
+                created_at=datetime.now(timezone.utc),
+            )
+            session.add(call)
+            created += 1
+
+        if created:
+            session.commit()
+            log.info("auto_create_phone_calls: создано %d PhoneCall из Conversation", created)
+    return created
+
+
 def process_one() -> bool:
     """Обрабатывает одну задачу. WORKER_MODE фильтрует scope."""
     # Этап 1: транскрипция встреч (scope: transcribe)
@@ -491,6 +549,12 @@ def process_one() -> bool:
     if conv_id is not None:
         process_conversation_analysis(conv_id)
         return True
+
+    # Этап 2.85: auto-create PhoneCall из проанализированных Conversation (scope: analyze)
+    if _is_mode("analyze"):
+        phone_created = auto_create_phone_calls()
+        if phone_created:
+            return True
 
     # Этап 2.9: speaker diarization — отключен, Gemini делает это в транскрипте
     # if os.environ.get("OM_ENABLE_DIARIZATION", "1") == "1":

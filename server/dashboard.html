@@ -502,6 +502,7 @@
         <button class="tab active" data-tab="team">👥 Команда</button>
         <button class="tab" data-tab="today">Сегодня</button>
         <button class="tab" data-tab="meetings">Встречи</button>
+        <button class="tab" data-tab="calls">📞 Звонки</button>
         <button class="tab" data-tab="voice">Голос</button>
         <button class="tab" data-tab="conversations">Разговоры</button>
         <button class="tab" data-tab="windows">Окна</button>
@@ -562,6 +563,15 @@
         <div class="panel">
           <h2>История встреч</h2>
           <div id="meetingsTable"></div>
+        </div>
+      </div>
+
+      <!-- Tab: Звонки -->
+      <div class="tab-content" data-tab-content="calls" hidden>
+        <div id="callsSummary" class="day-summary"></div>
+        <div class="panel">
+          <h2>📞 Звонки</h2>
+          <div id="callsList"></div>
         </div>
       </div>
 
@@ -734,11 +744,12 @@
     let dailyPollTimer = null;
 
     // Pagination state
-    let voicePage = 0, windowsPage = 0, conversationsPage = 0, screenshotsPage = 0;
+    let voicePage = 0, windowsPage = 0, conversationsPage = 0, screenshotsPage = 0, callsPage = 0;
     const VOICE_PAGE_SIZE = 20;
     const WINDOWS_PAGE_SIZE = 20;
     const CONVERSATIONS_PAGE_SIZE = 10;
     const SCREENSHOTS_PAGE_SIZE = 20;
+    const CALLS_PAGE_SIZE = 20;
 
     function renderPagination(page, totalItems, pageSize, onPageChange) {
       const totalPages = Math.ceil(totalItems / pageSize);
@@ -765,6 +776,10 @@
         } else {
           pollDailyReport(selectedAgent, $("#dailyDate").value);
         }
+      } else if (name === "calls") {
+        loadCalls();
+        clearDailyPoll();
+        if (typeof clearWeeklyPoll === "function") clearWeeklyPoll();
       } else if (name === "keystroke-text") {
         loadKeystrokeTexts();
         clearDailyPoll();
@@ -866,7 +881,7 @@
     async function loadAgentData() {
       if (!selectedAgent) return;
       // Reset pagination on data reload
-      voicePage = 0; windowsPage = 0; conversationsPage = 0; screenshotsPage = 0;
+      voicePage = 0; windowsPage = 0; conversationsPage = 0; screenshotsPage = 0; callsPage = 0;
       const rq = rangeQuery();
       const [daySummaryR, windowsR, meetingsR, voiceR, activityR, convListR, convSumR, scrR] = await Promise.all([
         fetch(`/agents/${selectedAgent}/day_summary?${rq}`),
@@ -1088,6 +1103,156 @@
             ${errorsHtml}
             ${recHtml}
             ${c.key_observations?.length ? `<div style="margin-top:8px;"><strong>Наблюдения:</strong></div><ul style="font-size:12px;">${c.key_observations.map(x => `<li>${escapeHTML(x)}</li>`).join("")}</ul>` : ""}
+          </td>`;
+          row.after(detailRow);
+        });
+      });
+    }
+
+    // ───────────── Tab: Звонки ─────────────
+    let allCalls = [];
+    let lastCallsSummary = {};
+
+    async function loadCalls() {
+      if (!selectedAgent) {
+        $("#callsSummary").innerHTML = '';
+        $("#callsList").innerHTML = '<div class="empty">Выбери агента слева</div>';
+        return;
+      }
+      const rq = rangeQuery();
+      const [callsR, sumR] = await Promise.all([
+        fetch(`/agents/${selectedAgent}/calls?${rq}&limit=100`),
+        fetch(`/agents/${selectedAgent}/calls_summary?${rq}`),
+      ]);
+      allCalls = await callsR.json();
+      lastCallsSummary = await sumR.json();
+      callsPage = 0;
+      renderCallsSummary();
+      renderCallsPage();
+    }
+
+    function renderCallsSummary() {
+      const s = lastCallsSummary;
+      const el = $("#callsSummary");
+      el.innerHTML = `
+        <div class="day-tile meeting"><div class="label">всего звонков</div><div class="value">${s.total || 0}</div></div>
+        <div class="day-tile work"><div class="label">рабочих</div><div class="value">${s.work_count || 0}</div></div>
+        <div class="day-tile personal"><div class="label">личных</div><div class="value">${s.personal_count || 0}</div></div>
+        <div class="day-tile neutral"><div class="label">назначений</div><div class="value">${s.appointments || 0}</div></div>
+        <div class="day-tile work"><div class="label">продаж</div><div class="value">${s.sales || 0}</div></div>
+        <div class="day-tile ${s.avg_score != null ? (s.avg_score >= 7 ? 'work' : s.avg_score >= 4 ? 'meeting' : 'personal') : 'neutral'}"><div class="label">ср. оценка</div><div class="value">${s.avg_score != null ? s.avg_score + '/10' : '—'}</div></div>`;
+    }
+
+    window._setCallsPage = function(p) { callsPage = p; renderCallsPage(); };
+
+    function renderCallsPage() {
+      const el = $("#callsList");
+      if (!allCalls.length) {
+        el.innerHTML = '<div class="empty">звонков за этот период нет</div>';
+        return;
+      }
+      const paged = allCalls.slice(callsPage * CALLS_PAGE_SIZE, (callsPage + 1) * CALLS_PAGE_SIZE);
+      el.innerHTML = `<table>
+        <thead><tr>
+          <th>Время</th><th>Длит.</th><th>Источник</th><th>Тип</th><th>Сценарий</th><th>Оценка</th><th>Краткое</th>
+        </tr></thead>
+        <tbody>${paged.map(c => {
+          const sourceIcon = c.source === 'always_on' ? '📱' : '☎️';
+          const sourceLabel = c.source === 'always_on' ? 'микрофон' : 'телефония';
+          const audioLabel = c.audio_type === 'full' ? 'полная' : (c.audio_type === 'one_sided' ? 'одностор.' : '—');
+          const scenarioLabel = c.scenario ? ({appointment: 'назначение', primary_sale: 'первичная', secondary_sale: 'вторичная'}[c.scenario] || c.scenario) : '—';
+          const scoreHtml = c.final_score != null
+            ? `<span style="font-weight:700; color:${c.final_score >= 7 ? '#4ade80' : c.final_score >= 4 ? '#fbbf24' : '#f87171'}">${c.final_score}/10</span>`
+            : '<span class="muted">—</span>';
+          const summary = c.analysis && c.analysis.summary ? c.analysis.summary : (c.transcript ? c.transcript.slice(0, 100) + '...' : '—');
+          return `<tr class="meeting-row" data-callid="${c.call_id}">
+            <td>${fmtTime(c.started_at)}</td>
+            <td class="num">${fmtSec(Math.round(c.duration_seconds || 0))}</td>
+            <td>${sourceIcon} ${sourceLabel}</td>
+            <td>${audioLabel}</td>
+            <td>${scenarioLabel}</td>
+            <td>${scoreHtml}</td>
+            <td>${escapeHTML(summary)}</td>
+          </tr>`;
+        }).join("")}</tbody>
+      </table>` + renderPagination(callsPage, allCalls.length, CALLS_PAGE_SIZE, 'window._setCallsPage');
+
+      // Клик по строке — раскрываем чеклист + детали
+      el.querySelectorAll(".meeting-row[data-callid]").forEach(row => {
+        row.addEventListener("click", () => {
+          const cid = row.dataset.callid;
+          const existing = row.nextElementSibling;
+          if (existing && existing.classList.contains("call-detail")) {
+            existing.remove();
+            row.classList.remove("expanded");
+            return;
+          }
+          // Закрываем другие
+          el.querySelectorAll(".call-detail").forEach(d => d.remove());
+          el.querySelectorAll(".meeting-row").forEach(r => r.classList.remove("expanded"));
+
+          const c = paged.find(x => String(x.call_id) === cid);
+          if (!c) return;
+          row.classList.add("expanded");
+
+          let checklistHtml = "";
+          const cl = c.checklist;
+          if (cl && typeof cl === "object") {
+            const sIcon = {"yes": "✅", "done": "✅", "no": "❌", "missed": "❌", "partial": "⚠️", "n/a": "⬜"};
+            const sColor = {"yes": "#4ade80", "done": "#4ade80", "no": "#f87171", "missed": "#f87171", "partial": "#fbbf24", "n/a": "#666"};
+            let rows = "";
+            if (Array.isArray(cl)) {
+              rows = cl.map(s => `<tr>
+                <td style="width:24px; color:${sColor[s.status] || '#888'}">${sIcon[s.status] || "?"}</td>
+                <td style="width:180px; font-weight:600;">${s.step || ""}. ${escapeHTML(s.name || "")}</td>
+                <td style="color:${sColor[s.status] || '#888'}">${escapeHTML(s.comment || "")}</td>
+              </tr>`).join("");
+            } else {
+              rows = Object.entries(cl).map(([key, v]) => `<tr>
+                <td style="width:24px; color:${sColor[v.status] || '#888'}">${sIcon[v.status] || "?"}</td>
+                <td style="width:50px; font-weight:600;">${escapeHTML(key)}</td>
+                <td style="color:${sColor[v.status] || '#888'}">${escapeHTML(v.comment || "")}</td>
+              </tr>`).join("");
+            }
+            checklistHtml = `<div style="margin-top:12px;"><strong>Чеклист звонка:</strong></div>
+              <table style="width:100%; margin-top:6px; font-size:12px;">${rows}</table>`;
+          }
+
+          const analysisHtml = c.analysis && c.analysis.summary
+            ? `<div class="summary-box">${escapeHTML(c.analysis.summary)}</div>`
+            : "";
+
+          const errorsHtml = c.analysis && (c.analysis.critical_errors || []).length
+            ? `<div style="margin-top:8px; color:#f87171;"><strong>Критичные ошибки:</strong></div><ul style="font-size:12px;">${c.analysis.critical_errors.map(e => {
+                if (typeof e === "string") return `<li>${escapeHTML(e)}</li>`;
+                return `<li><strong>${escapeHTML(e.type || "")}</strong>${e.quote ? `: «${escapeHTML(e.quote)}»` : ""}</li>`;
+              }).join("")}</ul>`
+            : "";
+
+          const recHtml = c.analysis && c.analysis.recommendation
+            ? `<div style="margin-top:8px; padding:8px; background:rgba(74,222,128,0.08); border-radius:6px; font-size:12px;"><strong>Рекомендация:</strong> ${escapeHTML(c.analysis.recommendation)}</div>`
+            : "";
+
+          const transcriptHtml = c.transcript
+            ? `<details style="margin-top:10px;"><summary class="muted" style="cursor:pointer;">Транскрипт</summary><div class="transcript-text" style="margin-top:6px;">${escapeHTML(c.transcript)}</div></details>`
+            : "";
+
+          const metaHtml = `<div class="muted" style="font-size:11px; margin-top:8px;">
+            источник: ${c.source} · тип аудио: ${c.audio_type || '?'}
+            ${c.phone_number ? ' · тел: ' + escapeHTML(c.phone_number) : ''}
+            ${c.external_id ? ' · ext: ' + escapeHTML(c.external_id) : ''}
+            ${c.conversation_id ? ' · conv: #' + c.conversation_id : ''}
+          </div>`;
+
+          const detailRow = document.createElement("tr");
+          detailRow.className = "call-detail";
+          detailRow.innerHTML = `<td colspan="7" style="padding:12px 16px; background:rgba(255,255,255,0.03);">
+            ${metaHtml}
+            ${analysisHtml}
+            ${checklistHtml}
+            ${errorsHtml}
+            ${recHtml}
+            ${transcriptHtml}
           </td>`;
           row.after(detailRow);
         });
