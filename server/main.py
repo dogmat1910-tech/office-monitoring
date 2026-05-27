@@ -24,7 +24,11 @@ VOICE_DIR = BASE_DIR / "voice_data"
 VOICE_DIR.mkdir(parents=True, exist_ok=True)
 SCREENSHOTS_DIR = BASE_DIR / "screenshots_data"
 SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-engine = create_engine(f"sqlite:///{DB_PATH}", echo=False, connect_args={"check_same_thread": False})
+engine = create_engine(
+    f"sqlite:///{DB_PATH}",
+    echo=False,
+    connect_args={"check_same_thread": False, "timeout": 30},
+)
 
 # Токен для эндпоинтов которые дёргает внешний сервис (твой самописный календарь).
 # Конфигурируется через env. На сервере хранится в /etc/systemd/system/office-monitoring.service
@@ -1643,74 +1647,93 @@ def assign_agent_to_office(agent_id: str, office_id: int | None = None) -> dict:
 
 @app.get("/overview")
 def team_overview(hours: int = 24, date: str | None = None) -> dict:
-    """Свод по всем агентам за период hours или за конкретный день."""
+    """Свод по всем агентам за период. Оптимизировано: 6 batch-запросов вместо N×6."""
     now = datetime.now(timezone.utc)
     since, until = _time_range(date, hours)
-    # для daily report берём дату из параметра, или сегодняшнюю
     today_str = date if date else now.strftime("%Y-%m-%d")
 
     with Session(engine) as session:
         agents = session.exec(select(Agent).order_by(Agent.last_seen.desc())).all()
+        if not agents:
+            return {"agents": [], "offices": []}
+        agent_ids = [a.agent_id for a in agents]
         app_map = get_category_map(session)
         domain_map = get_domain_category_map(session)
 
-        # Активные встречи — для бейджа
-        active_meetings = session.exec(select(Meeting).where(Meeting.ended_at.is_(None))).all()
-        active_by_agent = {m.agent_id: m for m in active_meetings}
+        # ── Batch 1: все WindowSample за период (для категорий) ──
+        all_samples = session.exec(
+            select(WindowSample.agent_id, WindowSample.app_name, WindowSample.title, WindowSample.duration_seconds)
+            .where(WindowSample.captured_at >= since)
+            .where(WindowSample.captured_at < until)
+        ).all()
+        cats_by_agent: dict[str, dict[str, int]] = {}
+        for aid, app_name, title, secs in all_samples:
+            _, cat, _ = categorize_sample(app_name, title, app_map, domain_map)
+            cats_by_agent.setdefault(aid, {"work": 0, "personal": 0, "neutral": 0})
+            cats_by_agent[aid][cat] = cats_by_agent[aid].get(cat, 0) + int(secs or 0)
+
+        # ── Batch 2: все Meeting за период ──
+        all_meetings = session.exec(
+            select(Meeting).where(Meeting.started_at >= since)
+        ).all()
+        meetings_by_agent: dict[str, list] = {}
+        for m in all_meetings:
+            meetings_by_agent.setdefault(m.agent_id, []).append(m)
+        active_by_agent = {m.agent_id: m for m in all_meetings if m.ended_at is None}
+
+        # ── Batch 3: все Analysis для meeting_ids ──
+        all_meeting_ids = [m.id for m in all_meetings if m.id]
+        scores_by_meeting: dict[int, float] = {}
+        if all_meeting_ids:
+            all_analyses = session.exec(
+                select(Analysis.meeting_id, Analysis.final_score)
+                .where(Analysis.meeting_id.in_(all_meeting_ids))
+            ).all()
+            for mid, score in all_analyses:
+                if score is not None:
+                    scores_by_meeting[mid] = score
+
+        # ── Batch 4: все VoiceSegment за период (агрегация) ──
+        all_voice = session.exec(
+            select(VoiceSegment.agent_id, VoiceSegment.kind,
+                   func.count(VoiceSegment.id), func.sum(VoiceSegment.duration_seconds))
+            .where(VoiceSegment.started_at >= since)
+            .group_by(VoiceSegment.agent_id, VoiceSegment.kind)
+        ).all()
+        voice_by_agent: dict[str, dict] = {}
+        for aid, kind, cnt, dur in all_voice:
+            voice_by_agent.setdefault(aid, {})
+            voice_by_agent[aid][kind or "unclassified"] = {"count": int(cnt or 0), "seconds": int(dur or 0)}
+
+        # ── Batch 5: все DailyReport за сегодня ──
+        all_daily = session.exec(
+            select(DailyReport).where(DailyReport.report_date == today_str)
+        ).all()
+        daily_by_agent = {d.agent_id: d for d in all_daily}
+
+        # ── Batch 6: все Office ──
+        all_offices = session.exec(select(Office)).all()
+        offices_by_id = {o.id: o for o in all_offices}
 
         result = []
         for a in agents:
             last_seen = _as_utc(a.last_seen)
             online = (now - last_seen).total_seconds() < 60
 
-            # окна → категории
-            samples = session.exec(
-                select(WindowSample.app_name, WindowSample.title, WindowSample.duration_seconds)
-                .where(WindowSample.agent_id == a.agent_id)
-                .where(WindowSample.captured_at >= since)
-                .where(WindowSample.captured_at < until)
-            ).all()
-            by_cat = {"work": 0, "personal": 0, "neutral": 0}
-            for app_name, title, secs in samples:
-                _, cat, _ = categorize_sample(app_name, title, app_map, domain_map)
-                by_cat[cat] = by_cat.get(cat, 0) + int(secs or 0)
+            by_cat = cats_by_agent.get(a.agent_id, {"work": 0, "personal": 0, "neutral": 0})
 
-            # встречи
-            meetings = session.exec(
-                select(Meeting)
-                .where(Meeting.agent_id == a.agent_id)
-                .where(Meeting.started_at >= since)
-            ).all()
+            agent_meetings = meetings_by_agent.get(a.agent_id, [])
             meeting_seconds = sum(
                 int((_as_utc(m.ended_at) - _as_utc(m.started_at)).total_seconds())
-                for m in meetings if m.ended_at
+                for m in agent_meetings if m.ended_at
             )
-            # средняя оценка по завершённым встречам за период
-            meeting_ids = [m.id for m in meetings if m.id]
-            scores = []
-            if meeting_ids:
-                analyses = session.exec(
-                    select(Analysis).where(Analysis.meeting_id.in_(meeting_ids))
-                ).all()
-                scores = [an.final_score for an in analyses if an.final_score is not None]
+            scores = [scores_by_meeting[m.id] for m in agent_meetings if m.id in scores_by_meeting]
             avg_meeting_score = round(sum(scores) / len(scores), 1) if scores else None
 
-            # голос
-            voice = session.exec(
-                select(VoiceSegment.kind, func.count(VoiceSegment.id), func.sum(VoiceSegment.duration_seconds))
-                .where(VoiceSegment.agent_id == a.agent_id)
-                .where(VoiceSegment.started_at >= since)
-                .group_by(VoiceSegment.kind)
-            ).all()
-            voice_by_kind = {(k or "unclassified"): {"count": int(n or 0), "seconds": int(s or 0)} for k, n, s in voice}
+            voice_by_kind = voice_by_agent.get(a.agent_id, {})
             voice_total_seconds = sum(v["seconds"] for v in voice_by_kind.values())
 
-            # последний daily report (сегодня)
-            daily = session.exec(
-                select(DailyReport)
-                .where(DailyReport.agent_id == a.agent_id)
-                .where(DailyReport.report_date == today_str)
-            ).first()
+            daily = daily_by_agent.get(a.agent_id)
             daily_score = daily.productivity_score if daily and daily.status == "done" else None
             daily_status = daily.status if daily else None
             red_flags_count = 0
@@ -1723,7 +1746,7 @@ def team_overview(hours: int = 24, date: str | None = None) -> dict:
 
             office = None
             if a.office_id is not None:
-                o = session.exec(select(Office).where(Office.id == a.office_id)).first()
+                o = offices_by_id.get(a.office_id)
                 if o:
                     office = {"office_id": o.id, "name": o.name, "city": o.city}
             result.append({

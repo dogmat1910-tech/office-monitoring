@@ -29,7 +29,9 @@ from main import Meeting, VoiceSegment, WindowSample, engine, _as_utc
 log = logging.getLogger("worker")
 
 API_KEY = os.environ.get("OM_OPENROUTER_API_KEY", "")
-MODEL = os.environ.get("OM_LLM_MODEL_VOICE", os.environ.get("OM_LLM_MODEL", "anthropic/claude-sonnet-4-6"))
+# Haiku вместо Sonnet: при 180 агентах × ~50 сегментов/день = ~$2/день вместо ~$50/день.
+# Для коротких 1-2 предложений Haiku справляется не хуже.
+MODEL = os.environ.get("OM_LLM_MODEL_VOICE", "anthropic/claude-haiku-4.5")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 VALID_KINDS = {"meeting", "phone_work", "phone_personal", "office_chat", "other_speech", "noise"}
