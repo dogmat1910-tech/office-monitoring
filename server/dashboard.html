@@ -508,7 +508,6 @@
         <button class="tab" data-tab="windows">Окна</button>
         <button class="tab" data-tab="screenshots">Скрины</button>
         <button class="tab" data-tab="daily">Daily Report</button>
-        <button class="tab" data-tab="keystroke-text">💬 Переписки</button>
         <button class="tab" data-tab="audit">🔍 Audit LLM</button>
       </nav>
 
@@ -653,19 +652,6 @@
         </div>
       </div>
 
-      <!-- Tab: Переписки — классифицированный текст из whitelisted apps -->
-      <div class="tab-content" data-tab-content="keystroke-text" hidden>
-        <div class="panel">
-          <h2>💬 Переписки (LLM-классификация)</h2>
-          <div class="muted" style="margin-bottom: 12px;">
-            Текст из Telegram / WhatsApp / VK, классифицированный как рабочий или личный.
-            Сырой текст доступен только по кнопке «🔓 показать» — каждый просмотр логируется.
-          </div>
-          <div id="keystrokeTextStats" style="margin-bottom: 16px;"></div>
-          <div id="keystrokeTextList"></div>
-        </div>
-      </div>
-
       <!-- Tab: Audit LLM — ручная проверка категоризаций -->
       <div class="tab-content" data-tab-content="audit" hidden>
         <div class="panel">
@@ -778,10 +764,6 @@
         }
       } else if (name === "calls") {
         loadCalls();
-        clearDailyPoll();
-        if (typeof clearWeeklyPoll === "function") clearWeeklyPoll();
-      } else if (name === "keystroke-text") {
-        loadKeystrokeTexts();
         clearDailyPoll();
         if (typeof clearWeeklyPoll === "function") clearWeeklyPoll();
       } else if (name === "audit") {
@@ -1726,112 +1708,6 @@
     }
 
     // ───────────── Диагностика агента (модалка) ─────────────
-    // ───────────── Переписки (Keystroke Text) ─────────────
-    async function loadKeystrokeTexts() {
-      if (!selectedAgent) {
-        $("#keystrokeTextStats").innerHTML = '<div class="muted">Выбери агента слева</div>';
-        $("#keystrokeTextList").innerHTML = "";
-        return;
-      }
-      const rq = rangeQuery();
-      const r = await fetch(`/agents/${selectedAgent}/keystroke_texts?${rq}&limit=200`);
-      const data = await r.json();
-      renderKeystrokeTextStats(data);
-      renderKeystrokeTextList(data.items);
-    }
-
-    function renderKeystrokeTextStats(data) {
-      const bc = data.by_category || {};
-      const cc = data.chars_by_category || {};
-      const total = data.total || 0;
-      if (!total) {
-        $("#keystrokeTextStats").innerHTML = '<div class="empty">нет записей переписки за этот период (кейлоггер выключен или менеджер не писал в whitelisted приложениях)</div>';
-        return;
-      }
-      const workPct = total > 0 ? Math.round((bc.work || 0) / total * 100) : 0;
-      const personalPct = total > 0 ? Math.round((bc.personal || 0) / total * 100) : 0;
-      const unclearPct = total > 0 ? Math.round((bc.unclear || 0) / total * 100) : 0;
-      $("#keystrokeTextStats").innerHTML = `
-        <div style="display: flex; gap: 20px; align-items: center; padding: 12px; background: rgba(255,255,255,0.04); border-radius: 8px; flex-wrap: wrap;">
-          <div>
-            <div class="muted" style="font-size: 11px;">всего сессий</div>
-            <div style="font-size: 20px; font-weight: 700;">${total}</div>
-          </div>
-          <div>
-            <div class="muted" style="font-size: 11px;">работа</div>
-            <div style="font-size: 18px; color: #4ade80;">${bc.work || 0} <span style="font-size: 12px; opacity: 0.7;">(${workPct}%)</span></div>
-          </div>
-          <div>
-            <div class="muted" style="font-size: 11px;">личное</div>
-            <div style="font-size: 18px; color: #f87171;">${bc.personal || 0} <span style="font-size: 12px; opacity: 0.7;">(${personalPct}%)</span></div>
-          </div>
-          <div>
-            <div class="muted" style="font-size: 11px;">неясно</div>
-            <div style="font-size: 18px; color: #fbbf24;">${bc.unclear || 0} <span style="font-size: 12px; opacity: 0.7;">(${unclearPct}%)</span></div>
-          </div>
-          <div>
-            <div class="muted" style="font-size: 11px;">не обработано</div>
-            <div style="font-size: 14px; opacity: 0.5;">${bc.unclassified || 0}</div>
-          </div>
-          <div>
-            <div class="muted" style="font-size: 11px;">символов (work/personal)</div>
-            <div style="font-size: 13px;"><span style="color:#4ade80;">${cc.work || 0}</span> / <span style="color:#f87171;">${cc.personal || 0}</span></div>
-          </div>
-        </div>`;
-    }
-
-    function renderKeystrokeTextList(items) {
-      const el = $("#keystrokeTextList");
-      if (!items.length) {
-        el.innerHTML = "";
-        return;
-      }
-      el.innerHTML = items.map(item => {
-        const cat = item.llm_category || "unclassified";
-        const catLabel = {work: "работа", personal: "личное", unclear: "неясно", unclassified: "⏳"}[cat] || cat;
-        const catColor = {work: "#4ade80", personal: "#f87171", unclear: "#fbbf24", unclassified: "#888"}[cat] || "#888";
-        const confPct = item.llm_confidence != null ? Math.round(item.llm_confidence * 100) : null;
-        const confStr = confPct != null ? ` · conf ${confPct}%` : "";
-        const reason = item.llm_reason ? ` · ${escapeHTML(item.llm_reason)}` : "";
-        const time = fmtTime(item.started_at);
-        return `<div style="padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.06); display: grid; grid-template-columns: 60px 1fr auto; gap: 12px; align-items: center;">
-          <div style="font-size: 12px; color: #999;">${time}</div>
-          <div>
-            <div style="font-size: 13px;">
-              <span style="color: ${catColor}; font-weight: 600;">${catLabel}</span>
-              <span class="muted" style="font-size: 11px;">${confStr}${reason}</span>
-            </div>
-            <div class="muted" style="font-size: 11px; margin-top: 2px;">
-              ${escapeHTML(item.app_name)} · ${escapeHTML(item.window_title || "?")} · ${item.char_count} зн.
-            </div>
-            <div id="kt-text-${item.id}" style="margin-top: 4px; font-size: 12px; color: #ccc; display: none;"></div>
-          </div>
-          <button class="btn-secondary" style="padding: 4px 8px; font-size: 11px;" onclick="window.revealKeystrokeText(${item.id})">🔓</button>
-        </div>`;
-      }).join("");
-    }
-
-    window.revealKeystrokeText = async function(textId) {
-      if (!confirm("Показать текст сессии? Просмотр логируется.")) return;
-      const r = await fetch(`/admin/keystroke_text/${textId}/reveal`);
-      if (!r.ok) {
-        alert("Ошибка: " + r.status);
-        return;
-      }
-      const data = await r.json();
-      const el = document.getElementById(`kt-text-${textId}`);
-      if (el) {
-        el.textContent = data.text;
-        el.style.display = "block";
-        el.style.background = "rgba(255,255,255,0.05)";
-        el.style.padding = "6px 8px";
-        el.style.borderRadius = "4px";
-        el.style.borderLeft = "3px solid #fbbf24";
-        // Автоматически скрыть через 60 секунд
-        setTimeout(() => { el.style.display = "none"; el.textContent = ""; }, 60000);
-      }
-    };
-
     // ───────────── Audit LLM ─────────────
     async function loadAudit() {
       const [statsR, listR] = await Promise.all([

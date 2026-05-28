@@ -6,8 +6,6 @@ $ErrorActionPreference = "Stop"
 
 $ServerUrl   = if ($env:OM_SERVER_URL) { $env:OM_SERVER_URL } else { "https://office.lkdzrkk.pro" }
 $InstallCode = if ($env:OM_INSTALL_CODE) { $env:OM_INSTALL_CODE } else { "" }
-$KeystrokeText = if ($env:OM_ENABLE_KEYSTROKE_TEXT) { $env:OM_ENABLE_KEYSTROKE_TEXT } else { "0" }
-$KeystrokeApps = if ($env:OM_KEYSTROKE_TEXT_APPS) { $env:OM_KEYSTROKE_TEXT_APPS } else { "Telegram.exe,WhatsApp.exe,Discord.exe,kotatogram.exe,messenger.exe" }
 $InstallDir  = "C:\Program Files\office-monitoring"
 $DataDir     = "C:\ProgramData\office-monitoring"
 $TaskAgent   = "OfficeMonitoring"
@@ -118,8 +116,6 @@ set OM_INSTALL_DIR=$InstallDir
 set OM_DATA_DIR=$DataDir
 set OM_ENABLE_ALWAYS_ON_AUDIO=1
 set OM_INSTALL_CODE=$InstallCode
-set OM_ENABLE_KEYSTROKE_TEXT=$KeystrokeText
-set OM_KEYSTROKE_TEXT_APPS=$KeystrokeApps
 cd /d "$InstallDir"
 start "" "$agentPath"
 "@ | Set-Content -Path $runAgentBat -Encoding ASCII

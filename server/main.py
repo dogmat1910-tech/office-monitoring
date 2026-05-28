@@ -211,27 +211,6 @@ class IdleSample(SQLModel, table=True):
     interval_seconds: int  # длительность периода с прошлого сэмпла
 
 
-class KeystrokeText(SQLModel, table=True):
-    """Записанный текст из whitelisted приложения (Telegram/WhatsApp/VK).
-    Только если на клиенте включён OM_ENABLE_KEYSTROKE_TEXT=1. По умолчанию
-    отключено — требует юр.оформления (152-ФЗ, 138 УК).
-    Текст уже отфильтрован от потенциальных секретов на стороне агента
-    (длинные alphanumeric → [REDACTED]). Доступ к raw тексту в дашборде —
-    только админу с явным повышением прав, каждый просмотр логируется."""
-    id: int | None = Field(default=None, primary_key=True)
-    agent_id: str = Field(index=True)
-    app_name: str
-    window_title: str
-    started_at: datetime = Field(index=True)
-    ended_at: datetime
-    text: str  # уже маскированный
-    char_count: int  # длина оригинала до маскирования
-    llm_category: str | None = None  # work | personal | unclear (заполняет фоновый воркер)
-    llm_confidence: float | None = None
-    llm_reason: str | None = None
-    received_at: datetime
-
-
 class KeystrokeSample(SQLModel, table=True):
     """Агрегированная статистика нажатий клавиш по приложению/окну.
     НЕ хранит содержимое нажатий — только счётчик."""
@@ -404,20 +383,6 @@ class KeystrokeSamplesIn(BaseModel):
     samples: list[KeystrokeSampleIn]
 
 
-class KeystrokeTextSessionIn(BaseModel):
-    app_name: str
-    window_title: str = ""
-    started_at: datetime
-    ended_at: datetime
-    text: str
-    char_count: int = 0
-
-
-class KeystrokeTextsIn(BaseModel):
-    agent_id: str
-    sessions: list[KeystrokeTextSessionIn]
-
-
 class MeetingStartIn(BaseModel):
     agent_id: str
     client_name: str | None = None
@@ -438,7 +403,7 @@ app = FastAPI(title="office-monitoring server", version="0.4.0")
 # (категории, версия) — это нужно для bootstrap'а нового агента.
 _AGENT_PROTECTED_EXACT = {
     "/heartbeat", "/window_samples", "/idle_samples", "/keystroke_samples",
-    "/keystroke_texts", "/voice_segments", "/screenshots", "/diagnostics",
+    "/voice_segments", "/screenshots", "/diagnostics",
 }
 _AGENT_PROTECTED_RE = [
     re.compile(r"^/meetings/[^/]+/audio$"),
@@ -503,34 +468,12 @@ async def _auto_categorize_loop() -> None:
         await asyncio.sleep(_AUTO_CATEGORIZE_INTERVAL)
 
 
-_KEYSTROKE_TEXT_INTERVAL = int(os.environ.get("OM_KEYSTROKE_TEXT_INTERVAL", "60"))
-
-
-async def _keystroke_text_loop() -> None:
-    """Классифицирует записанный текст переписки через LLM (work/personal/unclear)."""
-    import classify_keystroke_text as ckt
-    loop = asyncio.get_running_loop()
-    await asyncio.sleep(45)
-    while True:
-        try:
-            result = await loop.run_in_executor(None, ckt.run_once, engine)
-            if result["processed"]:
-                logging.getLogger("main").info(
-                    "keystroke-text classified: %d sessions",
-                    result["processed"],
-                )
-        except Exception as e:
-            logging.getLogger("main").warning("keystroke-text loop error: %s", e)
-        await asyncio.sleep(_KEYSTROKE_TEXT_INTERVAL)
-
-
 @app.on_event("startup")
 def on_startup() -> None:
     SQLModel.metadata.create_all(engine)
     # Background task для LLM-категоризации — запускаем только если ключ OpenRouter есть
     if os.environ.get("OM_OPENROUTER_API_KEY"):
         asyncio.create_task(_auto_categorize_loop())
-        asyncio.create_task(_keystroke_text_loop())
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -899,33 +842,6 @@ def post_keystroke_samples(payload: KeystrokeSamplesIn) -> dict:
             ))
         session.commit()
     return {"status": "ok", "count": len(payload.samples)}
-
-
-@app.post("/keystroke_texts")
-def post_keystroke_texts(payload: KeystrokeTextsIn) -> dict:
-    """Принимает записанный текст из whitelisted приложений (Telegram/WhatsApp/VK).
-    Текст уже маскирован на клиенте (длинные alphanumeric → [REDACTED]).
-    Фоновая LLM-классификация (work/personal/unclear) запускается отдельным
-    воркером — здесь только складываем сырой текст."""
-    if not payload.sessions:
-        return {"status": "ok", "count": 0}
-    now = datetime.now(timezone.utc)
-    with Session(engine) as session:
-        for s in payload.sessions:
-            if not (s.text or "").strip():
-                continue
-            session.add(KeystrokeText(
-                agent_id=payload.agent_id,
-                app_name=s.app_name,
-                window_title=s.window_title or "",
-                started_at=_as_utc(s.started_at),
-                ended_at=_as_utc(s.ended_at),
-                text=s.text,
-                char_count=s.char_count or len(s.text),
-                received_at=now,
-            ))
-        session.commit()
-    return {"status": "ok", "count": len(payload.sessions)}
 
 
 @app.get("/agents/{agent_id}/activity_summary")
@@ -1324,103 +1240,6 @@ def set_app_category(payload: CategoryIn) -> dict:
                 ))
         session.commit()
     return {"status": "ok", "kind": payload.kind, "name": payload.name, "category": payload.category}
-
-
-@app.get("/agents/{agent_id}/keystroke_texts")
-def get_keystroke_texts(agent_id: str, hours: int = 24, date: str | None = None, limit: int = 100) -> dict:
-    """Возвращает классифицированные тексты переписки.
-    Текст НЕ включается по умолчанию (show_text=false в UI) —
-    админ должен явно нажать 🔓 чтобы раскрыть конкретную сессию."""
-    since, until = _time_range(date, hours)
-    with Session(engine) as session:
-        rows = session.exec(
-            select(KeystrokeText)
-            .where(KeystrokeText.agent_id == agent_id)
-            .where(KeystrokeText.started_at >= since)
-            .where(KeystrokeText.started_at < until)
-            .order_by(KeystrokeText.started_at.desc())
-            .limit(limit)
-        ).all()
-        # Статистика
-        total = len(rows)
-        by_cat = {"work": 0, "personal": 0, "unclear": 0, "unclassified": 0}
-        chars_by_cat = {"work": 0, "personal": 0, "unclear": 0, "unclassified": 0}
-        for r in rows:
-            cat = r.llm_category or "unclassified"
-            by_cat[cat] = by_cat.get(cat, 0) + 1
-            chars_by_cat[cat] = chars_by_cat.get(cat, 0) + r.char_count
-        items = [
-            {
-                "id": r.id,
-                "app_name": r.app_name,
-                "window_title": r.window_title,
-                "started_at": _as_utc(r.started_at).isoformat(),
-                "ended_at": _as_utc(r.ended_at).isoformat(),
-                "char_count": r.char_count,
-                "llm_category": r.llm_category,
-                "llm_confidence": r.llm_confidence,
-                "llm_reason": r.llm_reason,
-                # текст НЕ включаем — только по отдельному запросу с логированием
-            }
-            for r in rows
-        ]
-        return {
-            "total": total,
-            "by_category": by_cat,
-            "chars_by_category": chars_by_cat,
-            "items": items,
-        }
-
-
-@app.get("/admin/keystroke_text/{text_id}/reveal")
-def reveal_keystroke_text(text_id: int) -> dict:
-    """Раскрывает сырой текст одной сессии. Каждый вызов логируется."""
-    with Session(engine) as session:
-        row = session.get(KeystrokeText, text_id)
-        if not row:
-            raise HTTPException(404, "text not found")
-        logging.getLogger("audit").warning(
-            "REVEAL keystroke_text id=%d agent_id=%s app=%s time=%s",
-            text_id, row.agent_id, row.app_name,
-            _as_utc(row.started_at).isoformat(),
-        )
-        return {"id": row.id, "text": row.text}
-
-
-@app.post("/admin/classify_keystroke_text")
-def admin_classify_keystroke_text() -> dict:
-    """Принудительно гоняет классификатор сейчас (не дожидаясь воркера)."""
-    import classify_keystroke_text as ckt
-    return ckt.run_once(engine)
-
-
-@app.post("/admin/seed_keystroke_text")
-def admin_seed_keystroke_text() -> dict:
-    """Создаёт тестовые KeystrokeText для проверки классификатора. Только для прода/staging."""
-    samples = [
-        ("Telegram.exe", "Чат с Ивановым", "Здравствуйте, по 53-ФЗ статья 13б — нужно ВВК пройти, подскажите центр в Москве"),
-        ("Telegram.exe", "Чат с Машей", "Привет солнышко, что готовим сегодня на ужин? я уже еду домой"),
-        ("Telegram.exe", "Рабочая группа", "Сидоров перенёс встречу на завтра, я ему позвонил"),
-        ("WhatsApp.exe", "Андрей друг", "Ахах, ну ты даёшь, лол. Завтра в 8 в зал?"),
-        ("Telegram.exe", "Петров клиент", "Отправил вам договор и квитанцию, пожалуйста подпишите и пришлите скан"),
-        ("Telegram.exe", "?", "ок"),
-    ]
-    agent_id = "test-keystroke-seed"
-    now = datetime.now(timezone.utc)
-    with Session(engine) as session:
-        for app, win, text in samples:
-            session.add(KeystrokeText(
-                agent_id=agent_id,
-                app_name=app,
-                window_title=win,
-                started_at=now,
-                ended_at=now,
-                text=text,
-                char_count=len(text),
-                received_at=now,
-            ))
-        session.commit()
-    return {"seeded": len(samples)}
 
 
 @app.post("/admin/recategorize")

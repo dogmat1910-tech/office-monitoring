@@ -1,7 +1,7 @@
 """Retry-обёртка для LLM-запросов через OpenRouter.
 
 Используется всеми модулями: classify_voice, auto_categorize,
-classify_keystroke_text, analyze, analyze_conversation, daily_report.
+analyze, analyze_conversation, daily_report.
 
 Стратегия: 3 попытки, backoff 2→5→15 секунд. Ретраим на 429 (rate limit),
 500/502/503 (OpenRouter down), таймаут. Не ретраим 400 (наш баг).
